@@ -1,0 +1,5234 @@
+From 710b33fe3cecb2624e4b1e4a2653692e3dc57638 Mon Sep 17 00:00:00 2001
+From: Soo Yee Lim <sooyee@cs.ubc.ca>
+Date: Tue, 10 Sep 2024 00:02:28 -0700
+Subject: [PATCH] SandBPF
+
+\n\nAdd support for dynamic sandboxing of eBPF programs.
+
+Signed-off-by: Soo Yee Lim <sooyee@cs.ubc.ca>
+---
+ Makefile                             |   2 +-
+ arch/arm64/include/asm/bpf_sandbox.h |  97 ++++++
+ arch/arm64/include/asm/mte.h         |   4 +
+ arch/arm64/lib/mte.S                 |  16 +
+ arch/arm64/net/bpf_jit_comp.c        | 380 +++++++++++++++++++++-
+ arch/x86/include/asm/bpf_sandbox.h   | 165 ++++++++++
+ arch/x86/net/bpf_jit_comp.c          | 277 +++++++++++++++-
+ include/linux/bpf.h                  |  24 ++
+ include/linux/bpf_ctx.h              | 187 +++++++++++
+ include/linux/bpf_malloc.h           |  13 +
+ include/linux/bpf_map.h              |  68 ++++
+ include/linux/bpf_mte.h              | 137 ++++++++
+ include/linux/bpf_sandbox.h          | 342 ++++++++++++++++++++
+ include/linux/filter.h               |  66 +++-
+ include/uapi/linux/bpf.h             |   9 +-
+ kernel/bpf/Kconfig                   | 205 ++++++++++++
+ kernel/bpf/Makefile                  |   2 +
+ kernel/bpf/arraymap.c                |  86 ++++-
+ kernel/bpf/ctx.c                     | 383 ++++++++++++++++++++++
+ kernel/bpf/ctx_bitmap.c              | 372 ++++++++++++++++++++++
+ kernel/bpf/hashtab.c                 |  93 ++++--
+ kernel/bpf/malloc.c                  |  87 +++++
+ kernel/bpf/map.c                     | 195 ++++++++++++
+ kernel/bpf/mte.c                     | 339 ++++++++++++++++++++
+ kernel/bpf/mte_slow.c                |  68 ++++
+ kernel/bpf/ringbuf.c                 |  47 ++-
+ kernel/bpf/sandbox.c                 | 453 +++++++++++++++++++++++++++
+ kernel/bpf/syscall.c                 |   5 +
+ kernel/bpf/verifier.c                |  45 ++-
+ lib/Kconfig.debug                    |   2 +-
+ lib/Kconfig.kasan                    |   2 +-
+ mm/kasan/kasan.h                     |   2 +
+ net/core/filter.c                    |   8 +-
+ 33 files changed, 4106 insertions(+), 75 deletions(-)
+ create mode 100644 arch/arm64/include/asm/bpf_sandbox.h
+ create mode 100644 arch/x86/include/asm/bpf_sandbox.h
+ create mode 100644 include/linux/bpf_ctx.h
+ create mode 100644 include/linux/bpf_malloc.h
+ create mode 100644 include/linux/bpf_map.h
+ create mode 100644 include/linux/bpf_mte.h
+ create mode 100644 include/linux/bpf_sandbox.h
+ create mode 100644 kernel/bpf/ctx.c
+ create mode 100644 kernel/bpf/ctx_bitmap.c
+ create mode 100644 kernel/bpf/malloc.c
+ create mode 100644 kernel/bpf/map.c
+ create mode 100644 kernel/bpf/mte.c
+ create mode 100644 kernel/bpf/mte_slow.c
+ create mode 100644 kernel/bpf/sandbox.c
+
+diff --git a/Makefile b/Makefile
+index b4267d7a5..ea0a18897 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 6
+ PATCHLEVEL = 3
+ SUBLEVEL = 8
+-EXTRAVERSION =
++EXTRAVERSION = sandbpf0.2.0
+ NAME = Hurr durr I'ma ninja sloth
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/arm64/include/asm/bpf_sandbox.h b/arch/arm64/include/asm/bpf_sandbox.h
+new file mode 100644
+index 000000000..09469881a
+--- /dev/null
++++ b/arch/arm64/include/asm/bpf_sandbox.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Priyansh Rathi <techiepriyansh@gmail.com>
++ */
++
++#ifndef _ASM_BPF_SANDBOX_H
++#define _ASM_BPF_SANDBOX_H
++
++#include <asm/mte.h>
++#include <asm/memory.h>
++
++static __always_inline void convert_bpf_ctx_to_kernel_ctx(volatile u64 *ctx_ptr)
++{
++	volatile u64 ctx = __untagged_addr(*ctx_ptr);
++
++	asm volatile (
++		"sub %[c], %[c], #0x20\n"
++		"ldr %[c], [%[c]]\n"
++		: [c] "+r" (ctx)
++		:
++		);
++
++	*ctx_ptr = ctx;
++}
++
++static __always_inline u64 bpf_helper_get_prog_type(void)
++{
++	u64 prog_id;
++
++	asm volatile ("mov %[p], x12" : [p] "=r" (prog_id) :);
++
++	return prog_id;
++}
++
++static __always_inline u64 bpf_sandbox_get_trampoline_target(u64 *p)
++{
++	volatile u64 prog_id;
++	volatile u64 call_target;
++
++	asm volatile(
++		"mov %[p], x12\n"
++		"mov %[t], x11\n"
++		: [p] "=r" (prog_id), [t] "=r" (call_target)
++		:
++		);
++	*p = prog_id;
++
++	return call_target;
++}
++
++static __always_inline void bpf_sandbox_call_trampoline_target(volatile u64 call_target,
++		volatile u64 r1, volatile u64 r2, volatile u64 r3, volatile u64 r4,
++		volatile u64 r5)
++{
++	asm volatile (
++		"mov x0, %[a]\n"
++		"mov x1, %[b]\n"
++		"mov x2, %[c]\n"
++		"mov x3, %[d]\n"
++		"mov x4, %[e]\n"
++		"str lr, [sp, #-16]!\n"
++		"blr %[t]\n"
++		"ldr lr, [sp], #16\n"
++		:
++		: [t] "r" (call_target), [a] "r" (r1), [b] "r" (r2),
++		  [c] "r" (r3), [d] "r" (r4), [e] "r" (r5)
++		: "x0", "x1", "x2", "x3", "x4"
++		);
++}
++
++static __always_inline void bpf_sandbox_set_memory(void *mem_ptr,
++						   volatile uintptr_t	kern_ctx,
++						   volatile uintptr_t	or_mask,
++						   volatile uintptr_t	and_mask)
++{
++	volatile void *m = __untagged_addr(mem_ptr);
++
++	asm volatile (
++		// save and_mask and or_mask to the end of 'metadata' page
++		"stp %[am], %[om], [%[p], #-0x10]\n"
++		// save kern_ctx to the end of 'metadata' page
++		"str %[c], [%[p], #-0x20]\n"
++		:
++		: [p] "r" (m), [om] "r" (or_mask), [am] "r" (and_mask), [c] "r" (kern_ctx));
++}
++
++static __always_inline void bpf_sandbox_set_sp(void *sandbox)
++{
++	asm volatile (
++		// mov the new stack ptr to x3 (reg storing 4th argument)
++		"mov x3, %[a]\n"
++		"add x3, x3, 0x7f0\n"
++		:
++		: [a] "r" (sandbox));
++}
++
++#endif /* _ASM_BPF_SANDBOX_H */
+diff --git a/arch/arm64/include/asm/mte.h b/arch/arm64/include/asm/mte.h
+index 20dd06d70..900fe5d6e 100644
+--- a/arch/arm64/include/asm/mte.h
++++ b/arch/arm64/include/asm/mte.h
+@@ -102,6 +102,7 @@ long get_mte_ctrl(struct task_struct *task);
+ int mte_ptrace_copy_tags(struct task_struct *child, long request,
+ 			 unsigned long addr, unsigned long data);
+ size_t mte_probe_user_range(const char __user *uaddr, size_t size);
++void mte_assign_mem_tag_range(void *addr, size_t size);
+ 
+ #else /* CONFIG_ARM64_MTE */
+ 
+@@ -154,6 +155,9 @@ static inline int mte_ptrace_copy_tags(struct task_struct *child,
+ {
+ 	return -EIO;
+ }
++static inline void mte_assign_mem_tag_range(void *addr, size_t size)
++{
++}
+ 
+ #endif /* CONFIG_ARM64_MTE */
+ 
+diff --git a/arch/arm64/lib/mte.S b/arch/arm64/lib/mte.S
+index 5018ac03b..9f324f135 100644
+--- a/arch/arm64/lib/mte.S
++++ b/arch/arm64/lib/mte.S
+@@ -175,3 +175,19 @@ SYM_FUNC_START(mte_restore_page_tags)
+ 
+ 	ret
+ SYM_FUNC_END(mte_restore_page_tags)
++
++/*
++ * Assign allocation tags for a region of memory based on the pointer tag
++ *   x0 - source pointer
++ *   x1 - size
++ *
++ * Note: The address must be non-NULL and MTE_GRANULE_SIZE aligned and
++ * size must be non-zero and MTE_GRANULE_SIZE aligned.
++ */
++SYM_FUNC_START(mte_assign_mem_tag_range)
++1:	stg	x0, [x0]
++	add	x0, x0, #MTE_GRANULE_SIZE
++	subs	x1, x1, #MTE_GRANULE_SIZE
++	b.gt	1b
++	ret
++SYM_FUNC_END(mte_assign_mem_tag_range)
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index b26da8efa..da72c16a5 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -13,6 +13,8 @@
+ #include <linux/memory.h>
+ #include <linux/printk.h>
+ #include <linux/slab.h>
++#include <linux/bpf_map.h>
++#include <linux/bpf_mte.h>
+ 
+ #include <asm/asm-extable.h>
+ #include <asm/byteorder.h>
+@@ -133,6 +135,15 @@ static inline void emit_a64_mov_i64(const int reg, const u64 val,
+ 	bool inverse;
+ 	int shift;
+ 
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	struct bpf_map *map;
++
++	if (virt_addr_valid(val) && is_active_map(val)) {
++		map = (struct bpf_map *)val;
++		ctx->prog->map_info->current_active_map = map;
++	}
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++
+ 	if (!(nrm_tmp >> 32))
+ 		return emit_a64_mov_i(0, reg, (u32)val, ctx);
+ 
+@@ -184,6 +195,139 @@ static inline void emit_call(u64 target, struct jit_ctx *ctx)
+ 	emit(A64_BLR(tmp), ctx);
+ }
+ 
++#if defined(CONFIG_BPF_SFI_MASK_READ) || defined(CONFIG_BPF_SFI_MASK_WRITE)
++static inline u8 emit_sfi(u8 addr_reg, s16 off, struct jit_ctx *ctx, bool is_map)
++{
++	u64 mask;
++	u8 fp = bpf2a64[BPF_REG_FP];
++	u8 tmp = bpf2a64[TMP_REG_1];
++	u8 tmp2 = bpf2a64[TMP_REG_2];
++
++	if (is_map) {
++		// pr_info("EMIT MAP MASKING");
++		/* mov tmp, off */
++		emit_a64_mov_i(1, tmp, off, ctx);
++		/* add tmp, addr_reg, off // load effective address */
++		emit(A64_ADD(1, tmp, addr_reg, tmp), ctx);
++
++		#ifdef CONFIG_BPF_SFI_MASK_MAP_READ_WRITE
++		// If masking not supported for a mask, skip emitting masking checks
++		if (!IS_MASKING_ENABLED_FOR_MAP(ctx->prog->map_info->current_active_map->map_type))
++			return tmp;
++
++		if (ctx->prog->map_info->current_active_map->sandbox_and_mask &&
++			ctx->prog->map_info->current_active_map->sandbox_or_mask) {
++			// pr_info("EMIT SFI: array");
++			/* mov tmp2, and_mask */
++			mask = (u64)ctx->prog->map_info->current_active_map->sandbox_and_mask;
++			emit_a64_mov_i64(tmp2, mask, ctx);
++			/* and tmp, tmp, tmp2 // apply the AND mask */
++			emit(A64_AND(1, tmp, tmp, tmp2), ctx);
++			/* mov tmp2, or_mask */
++			mask = (u64)ctx->prog->map_info->current_active_map->sandbox_or_mask;
++			emit_a64_mov_i64(tmp2, mask, ctx);
++			/* or tmp, tmp, tmp2 // apply the OR mask */
++			emit(A64_ORR(1, tmp, tmp, tmp2), ctx);
++		} else {
++			// pr_info("EMIT SFI: hashmap");
++			/* mov tmp, off */
++			emit_a64_mov_i(1, tmp, off, ctx);
++			/* add tmp, addr_reg, off // load effective address */
++			emit(A64_ADD(1, tmp, addr_reg, tmp), ctx);
++			/* sub tmp2, fp, (0x7f0 + 0x30) // location of the map's AND mask */
++			emit(A64_SUB_I(1, tmp2, fp, 0x7f0 + 0x30), ctx);
++			/* ldr tmp2, [tmp2] // load the AND mask */
++			emit(A64_LDR64(tmp2, tmp2, A64_ZR), ctx);
++			/* and tmp, tmp, tmp2 // apply the AND mask */
++			emit(A64_AND(1, tmp, tmp, tmp2), ctx);
++			/* sub tmp2, fp, (0x7f0 + 0x28) // location of the map's OR mask */
++			emit(A64_SUB_I(1, tmp2, fp, 0x7f0 + 0x28), ctx);
++			/* ldr tmp2, [tmp2] // load the OR mask */
++			emit(A64_LDR64(tmp2, tmp2, A64_ZR), ctx);
++			/* or tmp, tmp, tmp2 // apply the OR mask */
++			emit(A64_ORR(1, tmp, tmp, tmp2), ctx);
++		}
++		#endif /* CONFIG_BPF_SFI_MASK_MAP_READ_WRITE */
++	} else {
++		/* mov tmp, off */
++		emit_a64_mov_i(1, tmp, off, ctx);
++		/* add tmp, addr_reg, off // load effective address */
++		emit(A64_ADD(1, tmp, addr_reg, tmp), ctx);
++		/* sub tmp2, fp, (0x7f0 + 0x10) // location of the AND mask */
++		emit(A64_SUB_I(1, tmp2, fp, 0x7f0 + 0x10), ctx);
++		/* ldr tmp2, [tmp2] // load the AND mask */
++		emit(A64_LDR64(tmp2, tmp2, A64_ZR), ctx);
++		/* and tmp, tmp, tmp2 // apply the AND mask */
++		emit(A64_AND(1, tmp, tmp, tmp2), ctx);
++		/* sub tmp2, fp, (0x7f0 + 0x8) // location of the OR mask */
++		emit(A64_SUB_I(1, tmp2, fp, 0x7f0 + 0x8), ctx);
++		/* ldr tmp2, [tmp2] // load the OR mask */
++		emit(A64_LDR64(tmp2, tmp2, A64_ZR), ctx);
++		/* or tmp, tmp, tmp2 // apply the OR mask */
++		emit(A64_ORR(1, tmp, tmp, tmp2), ctx);
++	}
++
++	return tmp;
++}
++#endif /* CONFIG_BPF_SFI_MASK_READ || CONFIG_BPF_SFI_MASK_WRITE */
++
++
++#ifdef CONFIG_BPF_SANDBOX_MTE
++static inline void emit_enable_el1_mte_checks(struct jit_ctx *ctx)
++{
++	/* Set TCO (Tag Check Override) to allow MTE checks
++	 *   msr tco, xzr
++	 */
++	emit(0xd51b42ff, ctx);
++
++	/* Set 40th bit of SCTLR_EL1 to 1
++	 * This enables MTE checks in synchronous mode
++	 *   mov x12, #1
++	 *   lsl x12, x12, #40
++	 *   mrs x10, SCTLR_EL1
++	 *   orr x12, x10, x12
++	 *   msr SCTLR_EL1, x12
++	 */
++	emit(0xd280002c, ctx);
++	emit(0xd3585d8c, ctx);
++	emit(0xd538100a, ctx);
++	emit(0xaa0c014c, ctx);
++	emit(0xd518100c, ctx);
++
++	/* isb */
++	emit(0xd5033fdf, ctx);
++}
++
++static inline void emit_disable_el1_mte_checks(struct jit_ctx *ctx)
++{
++	/* Set TCO (Tag Check Override) to disallow MTE checks
++	 *   mov x10, #1
++	 *   lsl x10, x10, #25
++	 *   msr tco, x10
++	 */
++	emit(0xd280002a, ctx);
++	emit(0xd367994a, ctx);
++	emit(0xd51b42ea, ctx);
++
++	/* isb */
++	emit(0xd5033fdf, ctx);
++}
++
++static inline void emit_set_mte_ptr_tag(u8 ptr_reg, u64 ptr_tag, struct jit_ctx *ctx)
++{
++	u8 tmp = bpf2a64[TMP_REG_1];
++
++	/* mov tmp, ~(0xfll << 56) // load tag bits clear mask */
++	emit_a64_mov_i64(tmp, ~(0xfll << 56), ctx);
++	/* and ptr_reg, ptr_reg, tmp // clear tag bits */
++	emit(A64_AND(1, ptr_reg, ptr_reg, tmp), ctx);
++	/* mov tmp, ptr_tag << 56 // load tag */
++	emit_a64_mov_i64(tmp, ptr_tag << 56, ctx);
++	/* orr ptr_reg, ptr_reg, tmp // set tag */
++	emit(A64_ORR(1, ptr_reg, ptr_reg, tmp), ctx);
++}
++#endif /* CONFIG_BPF_SANDBOX_MTE */
++
+ static inline int bpf2a64_offset(int bpf_insn, int off,
+ 				 const struct jit_ctx *ctx)
+ {
+@@ -279,13 +423,17 @@ static bool is_lsi_offset(int offset, int scale)
+ #define BTI_INSNS (IS_ENABLED(CONFIG_ARM64_BTI_KERNEL) ? 1 : 0)
+ #define PAC_INSNS (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL) ? 1 : 0)
+ 
++#define SANDBOX_MEMORY_MANAGEMENT_INSNS (IS_ENABLED(CONFIG_BPF_SANDBOX_SFI) ? 4 : 9)
++#define SANDBOX_STACK_MANAGEMENT_INSNS 2
++#define SANDBOX_MTE_INSNS (IS_ENABLED(CONFIG_BPF_SANDBOX_MTE) ? 7 : 0)
++
+ /* Offset of nop instruction in bpf prog entry to be poked */
+ #define POKE_OFFSET (BTI_INSNS + 1)
+ 
+ /* Tail call offset to jump into */
+ #define PROLOGUE_OFFSET (BTI_INSNS + 2 + PAC_INSNS + 8)
+ 
+-static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
++static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf, bool is_sandboxed)
+ {
+ 	const struct bpf_prog *prog = ctx->prog;
+ 	const bool is_main_prog = prog->aux->func_idx == 0;
+@@ -298,6 +446,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 	const u8 fpb = bpf2a64[FP_BOTTOM];
+ 	const int idx0 = ctx->idx;
+ 	int cur_offset;
++	int eff_prologue_offset, sandbox_insns = 0;
+ 
+ 	/*
+ 	 * BPF prog stack layout
+@@ -341,6 +490,51 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 	emit(A64_PUSH(fp, tcc, A64_SP), ctx);
+ 	emit(A64_PUSH(fpb, A64_R(28), A64_SP), ctx);
+ 
++#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++	if (is_sandboxed) {
++		/* x0 points to the top of the private memory.
++		 * ctx (if present) is copied to the top of the private memory.
++		 * So, effectively x0 points both to the top of the private memory and
++		 * ctx (if present). x12 the same as x0, except it's untagged.
++		 */
++
++		#ifdef CONFIG_BPF_SANDBOX_MTE
++		emit(A64_MOV(1, A64_R(12), A64_R(0)), ctx);
++		emit_set_mte_ptr_tag(A64_R(12), BPF_MTE_TAG_KERNEL, ctx);
++		/* sub x11, x12, #0x18 // location in metadata to save pointer to original stack */
++		emit(A64_SUB_I(1, A64_R(11), A64_R(12), 0x18), ctx);
++		#endif /* CONFIG_BPF_SANDBOX_MTE */
++		#ifdef CONFIG_BPF_SANDBOX_SFI
++		/* sub x11, x0, #0x18 // location in metadata to save pointer to original stack */
++		emit(A64_SUB_I(1, A64_R(11), A64_R(0), 0x18), ctx);
++		#endif /* CONFIG_BPF_SANDBOX_SFI */
++		/* mov x10, sp // move sp to x10 to subsequently store it in memory */
++		emit(A64_MOV(1, A64_R(10), A64_SP), ctx);
++		/* str x10, [x11] // save the original stack pointer in sandbox metadata */
++		emit(A64_STR64(A64_R(10), A64_R(11), A64_ZR), ctx);
++		/* add sp, x0, 0x7f0 // switch the stack pointer to private stack */
++		emit(A64_ADD_I(1, A64_SP, A64_R(0), 0x7f0), ctx);
++		sandbox_insns += SANDBOX_MEMORY_MANAGEMENT_INSNS;
++	}
++#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++
++#ifdef CONFIG_BPF_SANDBOX_STACK_MANAGEMENT
++	if (is_sandboxed) {
++		/* mov x28, sp // move sp to x28, a callee-saved reg */
++		emit(A64_MOV(1, A64_R(28), A64_SP), ctx);
++		/* mov sp, x3 // switch the stack pointer to the private stack */
++		emit(A64_MOV(1, A64_SP, A64_R(3)), ctx);
++		sandbox_insns += SANDBOX_STACK_MANAGEMENT_INSNS;
++	}
++#endif /* CONFIG_BPF_SANDBOX_STACK_MANAGEMENT */
++
++// #ifdef CONFIG_BPF_SANDBOX_MTE
++//	if (is_sandboxed) {
++//		emit_enable_el1_mte_checks(ctx);
++//		sandbox_insns += SANDBOX_MTE_INSNS;
++//	}
++// #endif /* CONFIG_BPF_SANDBOX_MTE */
++
+ 	/* Set up BPF prog stack base register */
+ 	emit(A64_MOV(1, fp, A64_SP), ctx);
+ 
+@@ -349,9 +543,10 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 		emit(A64_MOVZ(1, tcc, 0, 0), ctx);
+ 
+ 		cur_offset = ctx->idx - idx0;
+-		if (cur_offset != PROLOGUE_OFFSET) {
++		eff_prologue_offset = PROLOGUE_OFFSET + sandbox_insns;
++		if (cur_offset != eff_prologue_offset) {
+ 			pr_err_once("PROLOGUE_OFFSET = %d, expected %d!\n",
+-				    cur_offset, PROLOGUE_OFFSET);
++				    cur_offset, eff_prologue_offset);
+ 			return -1;
+ 		}
+ 
+@@ -647,7 +842,7 @@ static void build_plt(struct jit_ctx *ctx)
+ 		plt->target = (u64)&dummy_tramp;
+ }
+ 
+-static void build_epilogue(struct jit_ctx *ctx)
++static void build_epilogue(struct jit_ctx *ctx, bool is_sandboxed)
+ {
+ 	const u8 r0 = bpf2a64[BPF_REG_0];
+ 	const u8 r6 = bpf2a64[BPF_REG_6];
+@@ -660,6 +855,32 @@ static void build_epilogue(struct jit_ctx *ctx)
+ 	/* We're done with BPF stack */
+ 	emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
+ 
++// #ifdef CONFIG_BPF_SANDBOX_MTE
++//	if (is_sandboxed)
++//		emit_disable_el1_mte_checks(ctx);
++// #endif /* CONFIG_BPF_SANDBOX_MTE */
++
++#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++	if (is_sandboxed) {
++		/* sub x11, sp, #(0x7f0 + 0x18) //load the location of original sp */
++		emit(A64_SUB_I(1, A64_R(11), A64_SP, 0x7f0 + 0x18), ctx);
++		#ifdef CONFIG_BPF_SANDBOX_MTE
++		emit_set_mte_ptr_tag(A64_R(11), BPF_MTE_TAG_KERNEL, ctx);
++		#endif /* CONFIG_BPF_SANDBOX_MTE */
++		/* ldr x10, [x11] // load original stack pointer into x10 */
++		emit(A64_LDR64(A64_R(10), A64_R(11), A64_ZR), ctx);
++		/* mov sp, x10 // restore the original stack pointer */
++		emit(A64_MOV(1, A64_SP, A64_R(10)), ctx);
++	}
++#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++
++#ifdef CONFIG_BPF_SANDBOX_STACK_MANAGEMENT
++	if (is_sandboxed) {
++		/* mov sp, x10 // restore the original stack pointer */
++		emit(A64_MOV(1, A64_SP, A64_R(28)), ctx);
++	}
++#endif /* CONFIG_BPF_SANDBOX_STACK_MANAGEMENT */
++
+ 	/* Restore x27 and x28 */
+ 	emit(A64_POP(fpb, A64_R(28), A64_SP), ctx);
+ 	/* Restore fs (x25) and x26 */
+@@ -752,7 +973,7 @@ static int add_exception_handler(const struct bpf_insn *insn,
+  * <0 - failed to JIT.
+  */
+ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+-		      bool extra_pass)
++		      bool extra_pass, bool is_sandboxed)
+ {
+ 	const u8 code = insn->code;
+ 	const u8 dst = bpf2a64[insn->dst_reg];
+@@ -779,6 +1000,14 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 	case BPF_ALU | BPF_MOV | BPF_X:
+ 	case BPF_ALU64 | BPF_MOV | BPF_X:
+ 		emit(A64_MOV(is64, dst, src), ctx);
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++		if (is_sandboxed && is_map_reg(ctx->prog, src)) {
++			bitmap_set(ctx->prog->map_info->map_reg_bitmap, dst, 1);
++			// pr_info("dst %d = src %d", dst, src);
++		} else if (is_sandboxed && is_map_reg(ctx->prog, dst)) {
++			bitmap_clear(ctx->prog->map_info->map_reg_bitmap, dst, 1);
++		}
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
+ 		break;
+ 	/* dst = dst OP src */
+ 	case BPF_ALU | BPF_ADD | BPF_X:
+@@ -1081,8 +1310,46 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 					    &func_addr, &func_addr_fixed);
+ 		if (ret < 0)
+ 			return ret;
++
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++		if (is_sandboxed) {
++			if (is_map_lookup((u64)func_addr)) {
++				ctx->prog->map_info->is_map_lookup_invoked = true;
++				bitmap_set(ctx->prog->map_info->map_reg_bitmap, r0, 1);
++				// pr_info("after lookup call, map in reg %d", r0);
++			} else {
++				ctx->prog->map_info->is_map_lookup_invoked = false;
++				bitmap_clear(ctx->prog->map_info->map_reg_bitmap, r0, 1);
++			}
++		}
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++
++#if defined(CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT) || defined(CONFIG_BPF_SFI_TRAMPOLINE)
++		if (is_sandboxed)
++			/* x12 can be safely used for passing the prog id
++			 * because emit_call only uses x10 (TMP_REG_1) and
++			 * emit_a64_mov_i64 uses no temp regs.
++			 */
++			emit_a64_mov_i64(A64_R(12), ctx->prog->type, ctx);
++#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT || CONFIG_BPF_SFI_TRAMPOLINE */
++
++#if defined(CONFIG_BPF_SANDBOX_CTX) || defined(CONFIG_BPF_SFI_TRAMPOLINE)
++		if (is_sandboxed) {
++			/* x11 can be safely used for passing the call target
++			 * because emit_call only uses x10 (TMP_REG_1) and
++			 * emit_a64_mov_i64 uses no temp regs.
++			 */
++			emit_a64_mov_i64(A64_R(11), func_addr, ctx);
++			func_addr = (u64)&sandbox_tramp;
++		}
++#endif /* CONFIG_BPF_SANDBOX_CTX || CONFIG_BPF_SFI_TRAMPOLINE */
++
+ 		emit_call(func_addr, ctx);
++		emit(A64_NOP, ctx);
++		emit(A64_NOP, ctx);
++		emit(A64_NOP, ctx);
+ 		emit(A64_MOV(1, r0, A64_R(0)), ctx);
++
+ 		break;
+ 	}
+ 	/* tail call */
+@@ -1125,6 +1392,44 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 	case BPF_LDX | BPF_PROBE_MEM | BPF_W:
+ 	case BPF_LDX | BPF_PROBE_MEM | BPF_H:
+ 	case BPF_LDX | BPF_PROBE_MEM | BPF_B:
++#ifdef CONFIG_BPF_SFI_MASK_READ
++		if (is_sandboxed) {
++			u8 masked_addr_reg;
++
++			// pr_info("READ: src = %d to dst = %d", src, dst);
++
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++			if (is_map_reg(ctx->prog, src)
++				&& ctx->prog->map_info->current_active_map) {
++				bitmap_set(ctx->prog->map_info->map_reg_bitmap, dst, 1);
++				masked_addr_reg = emit_sfi(src, off, ctx, true);
++			} else if (is_map_reg(ctx->prog, dst)
++					   && ctx->prog->map_info->current_active_map) {
++				bitmap_clear(ctx->prog->map_info->map_reg_bitmap, dst, 1);
++				masked_addr_reg = emit_sfi(src, off, ctx, false);
++			} else
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++			masked_addr_reg = emit_sfi(src, off, ctx, false);
++
++			switch (BPF_SIZE(code)) {
++			case BPF_W:
++				emit(A64_LDR32(dst, masked_addr_reg, A64_ZR), ctx);
++				break;
++			case BPF_H:
++				emit(A64_LDRH(dst, masked_addr_reg, A64_ZR), ctx);
++				break;
++			case BPF_B:
++				emit(A64_LDRB(dst, masked_addr_reg, A64_ZR), ctx);
++				break;
++			case BPF_DW:
++				emit(A64_LDR64(dst, masked_addr_reg, A64_ZR), ctx);
++				break;
++			}
++		} else {
++#endif /* CONFIG_BPF_SFI_MASK_READ */
++#ifdef CONFIG_BPF_SANDBOX_MTE_ANALOG_LOAD
++		emit(A64_LDR64(A64_R(10), A64_SP, A64_ZR), ctx);
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_LOAD */
+ 		if (ctx->fpb_offset > 0 && src == fp) {
+ 			src_adj = fpb;
+ 			off_adj = off + ctx->fpb_offset;
+@@ -1166,6 +1471,9 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 			}
+ 			break;
+ 		}
++#ifdef CONFIG_BPF_SFI_MASK_READ
++		}
++#endif /* CONFIG_BPF_SFI_MASK_READ */
+ 
+ 		ret = add_exception_handler(insn, ctx, dst);
+ 		if (ret)
+@@ -1240,6 +1548,39 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 	case BPF_STX | BPF_MEM | BPF_H:
+ 	case BPF_STX | BPF_MEM | BPF_B:
+ 	case BPF_STX | BPF_MEM | BPF_DW:
++#ifdef CONFIG_BPF_SFI_MASK_WRITE
++		if (is_sandboxed) {
++			u8 masked_addr_reg;
++
++			// pr_info("WRITE: src = %d to dst = %d", src, dst);
++
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++			if (is_map_reg(ctx->prog, dst)
++				&& ctx->prog->map_info->current_active_map) {
++				masked_addr_reg = emit_sfi(dst, off, ctx, true);
++			} else
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++			masked_addr_reg = emit_sfi(dst, off, ctx, false);
++
++			switch (BPF_SIZE(code)) {
++			case BPF_W:
++				emit(A64_STR32(src, masked_addr_reg, A64_ZR), ctx);
++				break;
++			case BPF_H:
++				emit(A64_STRH(src, masked_addr_reg, A64_ZR), ctx);
++				break;
++			case BPF_B:
++				emit(A64_STRB(src, masked_addr_reg, A64_ZR), ctx);
++				break;
++			case BPF_DW:
++				emit(A64_STR64(src, masked_addr_reg, A64_ZR), ctx);
++				break;
++			}
++		} else {
++#endif /* CONFIG_BPF_SFI_MASK_WRITE */
++#ifdef CONFIG_BPF_SANDBOX_MTE_ANALOG_LOAD
++		emit(A64_LDR64(A64_R(10), A64_SP, A64_ZR), ctx);
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_LOAD */
+ 		if (ctx->fpb_offset > 0 && dst == fp) {
+ 			dst_adj = fpb;
+ 			off_adj = off + ctx->fpb_offset;
+@@ -1281,6 +1622,9 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 			}
+ 			break;
+ 		}
++#ifdef CONFIG_BPF_SFI_MASK_WRITE
++		}
++#endif /* CONFIG_BPF_SFI_MASK_WRITE */
+ 		break;
+ 
+ 	case BPF_STX | BPF_ATOMIC | BPF_W:
+@@ -1374,7 +1718,7 @@ static int find_fpb_offset(struct bpf_prog *prog)
+ 	return offset;
+ }
+ 
+-static int build_body(struct jit_ctx *ctx, bool extra_pass)
++static int build_body(struct jit_ctx *ctx, bool extra_pass, bool is_sandboxed)
+ {
+ 	const struct bpf_prog *prog = ctx->prog;
+ 	int i;
+@@ -1394,7 +1738,7 @@ static int build_body(struct jit_ctx *ctx, bool extra_pass)
+ 
+ 		if (ctx->image == NULL)
+ 			ctx->offset[i] = ctx->idx;
+-		ret = build_insn(insn, ctx, extra_pass);
++		ret = build_insn(insn, ctx, extra_pass, is_sandboxed);
+ 		if (ret > 0) {
+ 			i++;
+ 			if (ctx->image == NULL)
+@@ -1462,6 +1806,16 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 	struct jit_ctx ctx;
+ 	u8 *image_ptr;
+ 
++#ifndef CONFIG_BPF_SANDBOX
++	bool is_sandboxed = 0;
++#else
++	bool is_sandboxed = IS_SANDBOX_ENABLED(prog->type);
++#endif /* CONFIG_BPF_SANDBOX */
++
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	bpf_sandbox_map_info_init(prog);
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++
+ 	if (!prog->jit_requested)
+ 		return orig_prog;
+ 
+@@ -1510,18 +1864,18 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 	 * BPF line info needs ctx->offset[i] to be the offset of
+ 	 * instruction[i] in jited image, so build prologue first.
+ 	 */
+-	if (build_prologue(&ctx, was_classic)) {
++	if (build_prologue(&ctx, was_classic, is_sandboxed)) {
+ 		prog = orig_prog;
+ 		goto out_off;
+ 	}
+ 
+-	if (build_body(&ctx, extra_pass)) {
++	if (build_body(&ctx, extra_pass, is_sandboxed)) {
+ 		prog = orig_prog;
+ 		goto out_off;
+ 	}
+ 
+ 	ctx.epilogue_offset = ctx.idx;
+-	build_epilogue(&ctx);
++	build_epilogue(&ctx, is_sandboxed);
+ 	build_plt(&ctx);
+ 
+ 	extable_align = __alignof__(struct exception_table_entry);
+@@ -1549,15 +1903,15 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 	ctx.idx = 0;
+ 	ctx.exentry_idx = 0;
+ 
+-	build_prologue(&ctx, was_classic);
++	build_prologue(&ctx, was_classic, is_sandboxed);
+ 
+-	if (build_body(&ctx, extra_pass)) {
++	if (build_body(&ctx, extra_pass, is_sandboxed)) {
+ 		bpf_jit_binary_free(header);
+ 		prog = orig_prog;
+ 		goto out_off;
+ 	}
+ 
+-	build_epilogue(&ctx);
++	build_epilogue(&ctx, is_sandboxed);
+ 	build_plt(&ctx);
+ 
+ 	/* 3. Extra pass to validate JITed code. */
+diff --git a/arch/x86/include/asm/bpf_sandbox.h b/arch/x86/include/asm/bpf_sandbox.h
+new file mode 100644
+index 000000000..c4053114e
+--- /dev/null
++++ b/arch/x86/include/asm/bpf_sandbox.h
+@@ -0,0 +1,165 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++
++#ifndef _ASM_BPF_SANDBOX_H
++#define _ASM_BPF_SANDBOX_H
++
++/**
++ * convert_bpf_ctx_to_kernel_ctx() - change the bpf ctx to the
++ *									 kernel ctx (for helpers)
++ */
++static __always_inline void convert_bpf_ctx_to_kernel_ctx(void)
++{
++	__asm__ __volatile__ (
++		"pop %%rdi\n\t"
++		"mov -0x20(%%rdi), %%rdi\n\t"
++		"push %%rdi\n\t"
++		:
++		:
++		);
++}
++
++/**
++ * bpf_helper_get_prog_type() - gets the program type ID
++ *
++ * Return: program type ID
++ */
++static __always_inline u64 bpf_helper_get_prog_type(void)
++{
++	u64 prog_id;
++
++	__asm__ __volatile__ (
++		"mov %%r9, %[p]\n\t"
++		: [p] "=r" (prog_id)
++		:
++		);
++
++	return prog_id;
++}
++
++/**
++ * bpf_sandbox_get_trampoline_target() - gets the call target address from r9 register
++ *
++ * @p: pointer for program type identifer
++ *
++ * Pushes the registers values to the stack and saves the values of the program
++ * type identifer and helper function address into the prog_id and call_target
++ * variables, respectively, so that their values are acessible by the C code.
++ *
++ * Return: Returns a 64 bit unsigned integeter, call_target, which is the address
++ * of the helper function.
++ */
++static __always_inline u64 bpf_sandbox_get_trampoline_target(u64 *p)
++{
++	volatile u64 prog_id;
++	volatile u64 call_target;
++
++	// Get the call target address
++	__asm__ __volatile__ (
++		"push %%r9\n\t"
++		"push %%rsi\n\t"
++		"push %%rdx\n\t"
++		"push %%rcx\n\t"
++		"push %%r8\n\t"
++		"push %%rdi\n\t"
++		"mov %%r9, %[p]\n\t"
++		"mov %%r11, %[t]\n\t"
++		: [p] "=r" (prog_id), [t] "=r" (call_target)
++		:
++		);
++	*p = prog_id;
++
++	return call_target;
++}
++
++/**
++ * bpf_sandbox_call_trampoline_target() - calls the valid helper function
++ *
++ * @call_target: helper function address
++ *
++ * Removes the data from the stack, stores it in the respective registers, and
++ * calls the helper function that is specified in the input list.
++ */
++static __always_inline u64 bpf_sandbox_call_trampoline_target(volatile u64 call_target)
++{
++	volatile u64 ret;
++
++	// Call the valid helper function
++	__asm__ __volatile__ (
++		"pop %%rdi\n\t"
++		"pop %%r8\n\t"
++		"pop %%rcx\n\t"
++		"pop %%rdx\n\t"
++		"pop %%rsi\n\t"
++		"pop %%r9\n\t"
++		"call *%[t]\n\t"
++		"mov %%rax, %[r]\n\t"
++		: [r] "=r" (ret)
++		: [t] "r" (call_target)
++		);
++
++	return ret;
++}
++
++// TODO: pass offset from filter.h, don't hardcode
++
++/**
++ * bpf_sandbox_set_memory() - configures bpf sandbox memory without context info
++ *
++ * @mem_ptr: pointer to memory allocated in the bpf sandbox cache
++ * @kern_ctx: address of the original kernel ctx
++ * @or_mask: OR opperation mask for address maskinng
++ * @and_mask: OR opperation mask for address maskinng
++ *
++ * For the bpf program, this function ensures that the top of the private stack
++ * is retained at the bottom of private memory, and the OR and AND masks
++ * are sored in registers.
++ */
++static __always_inline void bpf_sandbox_set_memory(void *mem_ptr,
++						   volatile uintptr_t	kern_ctx,
++						   volatile uintptr_t	or_mask,
++						   volatile uintptr_t	and_mask)
++{
++	volatile void *m = mem_ptr;
++
++	__asm__ __volatile__ (
++		// save or_mask to the end of 'metadata' page
++		"mov %[om], -0x8(%[p])\n\t"
++		// save and_mask to the end of 'metadata' page
++		"mov %[am], -0x10(%[p])\n\t"
++		// save kern_ctx to the end of 'metadata' page
++		"mov %[c], -0x20(%[p])\n\t"
++		: [p] "=r" (m)
++		: [om] "r" (or_mask), [am] "r" (and_mask), [c] "r" (kern_ctx)
++		);
++}
++
++/**
++ * bpf_sandbox_retrieve_counter() - saves the masking and trampoline counts
++ *
++ * @mask: pointer to masking count
++ * @tramp: pointer to trampoline count
++ *
++ * Retrieves the number of times masking and trampoline calls are made
++ * during the execution of a specific bpf program in order to make
++ * complexity evaluations.
++ */
++static __always_inline void bpf_sandbox_retrieve_counter(u64 *mask, u64 *tramp)
++{
++	volatile u64 masking_count = 0;
++	volatile u64 trampoline_count = 0;
++
++	__asm__ __volatile__ (
++		"mov %%r8, %[m]\n\t"            // save the masking count
++		"mov %%r9, %[t]\n\t"            // save the trampoline count
++		: [m] "=r" (masking_count), [t] "=r" (trampoline_count)
++		:
++		);
++
++	*mask = masking_count;
++	*tramp = trampoline_count;
++}
++
++#endif /* _ASM_BPF_SANDBOX_H */
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 1056bbf55..b34fd905a 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -16,19 +16,28 @@
+ #include <asm/set_memory.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/text-patching.h>
++/*** SANDBOX BPF START ***/
++#include <linux/bpf_sandbox.h>
++#include <linux/bpf_map.h>
++/*** SANDBOX BPF END ***/
+ 
+-static u8 *emit_code(u8 *ptr, u32 bytes, unsigned int len)
++/*** SANDBOX BPF START ***/
++static u8 *emit_code(u8 *ptr, u64 bytes, unsigned int len)
+ {
+ 	if (len == 1)
+ 		*ptr = bytes;
+ 	else if (len == 2)
+ 		*(u16 *)ptr = bytes;
+-	else {
++	else if (len == 4) {
+ 		*(u32 *)ptr = bytes;
+ 		barrier();
++	} else {
++		*(u64 *)ptr = bytes;
++		barrier();
+ 	}
+ 	return ptr + len;
+ }
++/*** SANDBOX BPF END ***/
+ 
+ #define EMIT(bytes, len) \
+ 	do { prog = emit_code(prog, bytes, len); } while (0)
+@@ -47,6 +56,11 @@ static u8 *emit_code(u8 *ptr, u32 bytes, unsigned int len)
+ #define EMIT4_off32(b1, b2, b3, b4, off) \
+ 	do { EMIT4(b1, b2, b3, b4); EMIT(off, 4); } while (0)
+ 
++/*** SANDBOX BPF START ***/
++#define EMIT2_off64(b1, b2, off) \
++	do { EMIT2(b1, b2); EMIT(off, 8); } while (0)
++/*** SANDBOX BPF END ***/
++
+ #ifdef CONFIG_X86_KERNEL_IBT
+ #define EMIT_ENDBR()	EMIT(gen_endbr(), 4)
+ #else
+@@ -252,8 +266,14 @@ struct jit_context {
+ 
+ /* Number of bytes emit_patch() needs to generate instructions */
+ #define X86_PATCH_SIZE		5
++/*** SANDBOX BPF START ***/
+ /* Number of bytes that will be skipped on tailcall */
+-#define X86_TAIL_CALL_OFFSET	(11 + ENDBR_INSN_SIZE)
++#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++	#define X86_TAIL_CALL_OFFSET	(11 + 11 + ENDBR_INSN_SIZE)
++#else
++	#define X86_TAIL_CALL_OFFSET	(11 + ENDBR_INSN_SIZE)
++#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++/*** SANDBOX BPF END ***/
+ 
+ static void push_callee_regs(u8 **pprog, bool *callee_regs_used)
+ {
+@@ -291,7 +311,7 @@ static void pop_callee_regs(u8 **pprog, bool *callee_regs_used)
+  * while jumping to another program
+  */
+ static void emit_prologue(u8 **pprog, u32 stack_depth, bool ebpf_from_cbpf,
+-			  bool tail_call_reachable, bool is_subprog)
++			  bool tail_call_reachable, bool is_subprog, bool is_sandboxed)
+ {
+ 	u8 *prog = *pprog;
+ 
+@@ -307,15 +327,28 @@ static void emit_prologue(u8 **pprog, u32 stack_depth, bool ebpf_from_cbpf,
+ 		else
+ 			EMIT2(0x66, 0x90); /* nop2 */
+ 	}
+-	EMIT1(0x55);             /* push rbp */
+-	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
++
++	EMIT1(0x55);             /* push rbp (to original stack) */
++	/*** SANDBOX BPF START ***/
++	#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++		if (is_sandboxed) {
++			/* mov -0x18(rdi), rsp (save the original rsp to the metadata page) */
++			EMIT4(0x48, 0x89, 0x67, 0xE8);
++			/* mov rsp, 0x7ff(rdi) (compute the top of stack from ctx, copy to rsp) */
++			EMIT3_off32(0x48, 0x8D, 0xA7, BPF_SANDBOX_SIZE-1);
++		}
++	#endif
++	/*** SANDBOX BPF END ***/
++	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */ // move rbp to the new sandbox rsp
+ 
+ 	/* X86_TAIL_CALL_OFFSET is here */
+ 	EMIT_ENDBR();
+ 
+-	/* sub rsp, rounded_stack_depth */
++
+ 	if (stack_depth)
+-		EMIT3_off32(0x48, 0x81, 0xEC, round_up(stack_depth, 8));
++			EMIT3_off32(0x48, 0x81, 0xEC, round_up(stack_depth, 8));
++	/*** SANDBOX BPF END ***/
++
+ 	if (tail_call_reachable)
+ 		EMIT1(0x50);         /* push rax */
+ 	*pprog = prog;
+@@ -749,6 +782,79 @@ static void maybe_emit_1mod(u8 **pprog, u32 reg, bool is64)
+ 	*pprog = prog;
+ }
+ 
++/*** SANDBOX BPF START ***/
++struct inst_info {
++	u16 progtype;
++	u16 addrmask;
++	u16 tramp;
++};
++
++#if defined(CONFIG_BPF_SFI_MASK_READ) || defined(CONFIG_BPF_SFI_MASK_WRITE)
++static void emit_sfi(struct bpf_prog *bpf_prog, u8 **pprog, u32 size, u32 dst_reg, u32 src_reg,
++					 int off, u32 stack_depth, bool is_map)
++{
++	u64 mask;
++	u8 *prog = *pprog;
++	u32 temp_reg = X86_REG_R9;
++
++	if (is_map) {
++		// lea    0x[off](target_reg), temp_reg
++		EMIT2(add_2mod(0x48, dst_reg, temp_reg), 0x8D);
++		emit_insn_suffix(&prog, dst_reg, temp_reg, off);
++
++		#ifdef CONFIG_BPF_SFI_MASK_MAP_READ_WRITE
++		// If masking not supported for a mask, skip emitting masking checks
++		if (!IS_MASKING_ENABLED_FOR_MAP(bpf_prog->map_info->current_active_map->map_type))
++			return;
++
++		if (bpf_prog->map_info->current_active_map->sandbox_and_mask &&
++			bpf_prog->map_info->current_active_map->sandbox_or_mask) {
++			// pr_info("EMIT SFI: array");
++			mask = (u64)bpf_prog->map_info->current_active_map->sandbox_and_mask;
++			// movabs $[and_mask] %r11
++			EMIT2_off64(0x49, 0xBB, mask);
++
++			// and %r11, %r9
++			EMIT3(0x4D, 0x21, 0xD9);
++
++			mask = (u64)bpf_prog->map_info->current_active_map->sandbox_or_mask;
++			// movabs $[or_mask] %r11
++			EMIT2_off64(0x49, 0xBB, mask);
++
++			// or %r11, %r9
++			EMIT3(0x4D, 0x09, 0xD9);
++		} else {
++			// pr_info("EMIT SFI: hashmap");
++			// and    0x[offset](%rbp) and_mask, temp_reg
++			EMIT3_off32(add_2mod(0x48, BPF_REG_FP, temp_reg),
++				0x23, add_2reg(0x80, BPF_REG_FP, temp_reg),
++				MAP_AND_MASK_OFFSET_FROM_RBP);
++
++			// or     0x[offset](%rbp) or_mask, temp_reg
++			EMIT3_off32(add_2mod(0x48, BPF_REG_FP, temp_reg),
++				0x0B, add_2reg(0x80, BPF_REG_FP, temp_reg),
++				MAP_OR_MASK_OFFSET_FROM_RBP);
++		}
++		#endif /* CONFIG_BPF_SFI_MASK_MAP_READ_WRITE */
++	} else {
++		// lea    0x[off](target_reg), temp_reg
++		EMIT2(add_2mod(0x48, dst_reg, temp_reg), 0x8D);
++		emit_insn_suffix(&prog, dst_reg, temp_reg, off);
++
++		// and    0x[offset](%rbp) and_mask, temp_reg
++		EMIT3_off32(add_2mod(0x48, BPF_REG_FP, temp_reg),
++			0x23, add_2reg(0x80, BPF_REG_FP, temp_reg), AND_MASK_OFFSET_FROM_RBP);
++
++		// or     0x[offset](%rbp) or_mask, temp_reg
++		EMIT3_off32(add_2mod(0x48, BPF_REG_FP, temp_reg),
++			0x0B, add_2reg(0x80, BPF_REG_FP, temp_reg), OR_MASK_OFFSET_FROM_RBP);
++	}
++
++	*pprog = prog;
++}
++#endif /* CONFIG_BPF_SFI_MASK_READ || CONFIG_BPF_SFI_MASK_WRITE */
++/*** SANDBOX BPF END ***/
++
+ /* LDX: dst_reg = *(u8*)(src_reg + off) */
+ static void emit_ldx(u8 **pprog, u32 size, u32 dst_reg, u32 src_reg, int off)
+ {
+@@ -964,7 +1070,7 @@ static void emit_shiftx(u8 **pprog, u32 dst_reg, u8 src_reg, bool is64, u8 op)
+ #define INSN_SZ_DIFF (((addrs[i] - addrs[i - 1]) - (prog - temp)))
+ 
+ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
+-		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
++		  int oldproglen, struct jit_context *ctx, bool jmp_padding, struct inst_info *info)
+ {
+ 	bool tail_call_reachable = bpf_prog->aux->tail_call_reachable;
+ 	struct bpf_insn *insn = bpf_prog->insnsi;
+@@ -978,15 +1084,29 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
+ 	u8 *prog = temp;
+ 	int err;
+ 
++	/*** SANDBOX BPF START ***/
++	u8 sandbox_ilen = 0;
++	#ifndef CONFIG_BPF_SANDBOX
++		bool is_sandboxed = 0;
++	#else
++		bool is_sandboxed = IS_SANDBOX_ENABLED(bpf_prog->type);
++	#endif /* CONFIG_BPF_SANDBOX */
++	/*** SANDBOX BPF END ***/
++
+ 	detect_reg_usage(insn, insn_cnt, callee_regs_used,
+ 			 &tail_call_seen);
+ 
+ 	/* tail call's presence in current prog implies it is reachable */
+ 	tail_call_reachable |= tail_call_seen;
+ 
++	/*** SANDBOX BPF START ***/
++	info->addrmask = 0;
++	info->tramp = 0;
++
+ 	emit_prologue(&prog, bpf_prog->aux->stack_depth,
+ 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
+-		      bpf_prog->aux->func_idx != 0);
++		      bpf_prog->aux->func_idx != 0, is_sandboxed);
++	/*** SANDBOX BPF END ***/
+ 	push_callee_regs(&prog, callee_regs_used);
+ 
+ 	ilen = prog - temp;
+@@ -1031,6 +1151,12 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
+ 			emit_mov_reg(&prog,
+ 				     BPF_CLASS(insn->code) == BPF_ALU64,
+ 				     dst_reg, src_reg);
++			#ifdef CONFIG_BPF_SFI_MAP_MASKING
++			if (is_sandboxed && is_map_reg(bpf_prog, src_reg))
++				bitmap_set(bpf_prog->map_info->map_reg_bitmap, dst_reg, 1);
++			else if (is_sandboxed && is_map_reg(bpf_prog, dst_reg))
++				bitmap_clear(bpf_prog->map_info->map_reg_bitmap, dst_reg, 1);
++			#endif /* CONFIG_BPF_SFI_MAP_MASKING */
+ 			break;
+ 
+ 			/* neg dst */
+@@ -1097,6 +1223,15 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
+ 
+ 		case BPF_LD | BPF_IMM | BPF_DW:
+ 			emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);
++			#ifdef CONFIG_BPF_SFI_MAP_MASKING
++			u64 imm64 = (u64)insn[1].imm << 32 | insn[0].imm;
++
++			if (virt_addr_valid(imm64) && is_active_map(imm64)) {
++				struct bpf_map *map = (struct bpf_map *)imm64;
++
++				bpf_prog->map_info->current_active_map = map;
++			}
++			#endif /* CONFIG_BPF_SFI_MAP_MASKING */
+ 			insn++;
+ 			i++;
+ 			break;
+@@ -1358,7 +1493,34 @@ st:			if (is_imm8(insn->off))
+ 		case BPF_STX | BPF_MEM | BPF_H:
+ 		case BPF_STX | BPF_MEM | BPF_W:
+ 		case BPF_STX | BPF_MEM | BPF_DW:
+-			emit_stx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);
++			/*** SANDBOX BPF START ***/
++			#ifdef CONFIG_BPF_SFI_MASK_WRITE
++			if (is_sandboxed) {
++				#ifdef CONFIG_BPF_SFI_MAP_MASKING
++				if (bpf_prog->map_info->current_active_map
++					&& is_map_reg(bpf_prog, dst_reg)) {
++					emit_sfi(bpf_prog, &prog, BPF_SIZE(insn->code), dst_reg,
++							src_reg, insn->off,
++							bpf_prog->aux->stack_depth, true);
++				} else
++				#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++				emit_sfi(bpf_prog, &prog, BPF_SIZE(insn->code), dst_reg,
++						src_reg, insn->off,
++						bpf_prog->aux->stack_depth, false);
++			}
++			#endif
++
++			#ifdef CONFIG_BPF_SFI_MASK_WRITE
++				if (is_sandboxed)
++					emit_stx(&prog, BPF_SIZE(insn->code),
++							X86_REG_R9, src_reg, 0);
++				else
++					emit_stx(&prog, BPF_SIZE(insn->code),
++							dst_reg, src_reg, insn->off);
++			#else
++				emit_stx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);
++			#endif
++			/*** SANDBOX BPF END ***/
+ 			break;
+ 
+ 			/* LDX: dst_reg = *(u8*)(src_reg + off) */
+@@ -1415,7 +1577,42 @@ st:			if (is_imm8(insn->off))
+ 				start_of_ldx = prog;
+ 				end_of_jmp[-1] = start_of_ldx - end_of_jmp;
+ 			}
+-			emit_ldx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn_off);
++			/*** SANDBOX BPF START ***/
++			#ifdef CONFIG_BPF_SFI_MASK_READ
++			if (is_sandboxed) {
++				#ifdef CONFIG_BPF_SFI_MAP_MASKING
++				if (bpf_prog->map_info->current_active_map
++					&& is_map_reg(bpf_prog, src_reg)) {
++					bitmap_set(bpf_prog->map_info->map_reg_bitmap, dst_reg, 1);
++					emit_sfi(bpf_prog, &prog, BPF_SIZE(insn->code), src_reg,
++							dst_reg, insn->off,
++							bpf_prog->aux->stack_depth, true);
++				} else if (bpf_prog->map_info->current_active_map
++					&& is_map_reg(bpf_prog, dst_reg)) {
++					bitmap_clear(bpf_prog->map_info->map_reg_bitmap,
++								 dst_reg, 1);
++					emit_sfi(bpf_prog, &prog, BPF_SIZE(insn->code), src_reg,
++						dst_reg, insn->off,
++						bpf_prog->aux->stack_depth, false);
++				} else
++				#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++				emit_sfi(bpf_prog, &prog, BPF_SIZE(insn->code), src_reg,
++						dst_reg, insn->off,
++						bpf_prog->aux->stack_depth, false);
++			}
++			#endif
++
++			#ifdef CONFIG_BPF_SFI_MASK_READ
++				if (is_sandboxed)
++					emit_ldx(&prog, BPF_SIZE(insn->code),
++							dst_reg, X86_REG_R9, 0);
++				else
++					emit_ldx(&prog, BPF_SIZE(insn->code),
++							dst_reg, src_reg, insn_off);
++			#else
++				emit_ldx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn_off);
++			#endif
++			/*** SANDBOX BPF END ***/
+ 			if (BPF_MODE(insn->code) == BPF_PROBE_MEM) {
+ 				struct exception_table_entry *ex;
+ 				u8 *_insn = image + proglen + (start_of_ldx - temp);
+@@ -1535,8 +1732,36 @@ st:			if (is_imm8(insn->off))
+ 			/* call */
+ 		case BPF_JMP | BPF_CALL: {
+ 			int offs;
+-
+ 			func = (u8 *) __bpf_call_base + imm32;
++			/*** SANDBOX BPF START ***/
++			#ifdef CONFIG_BPF_SFI_MAP_MASKING
++			if (is_sandboxed) {
++				if (is_map_lookup((u64)func)) {
++					bpf_prog->map_info->is_map_lookup_invoked = true;
++					bitmap_set(bpf_prog->map_info->map_reg_bitmap,
++							   BPF_REG_0, 1);
++					// pr_info("BPF JIT: lookup invoked, map in rax");
++				} else {
++					bitmap_clear(bpf_prog->map_info->map_reg_bitmap,
++							   BPF_REG_0, 1);
++					bpf_prog->map_info->is_map_lookup_invoked = false;
++				}
++			}
++			#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++			#if defined(CONFIG_BPF_SANDBOX_CTX) || \
++				defined(CONFIG_BPF_SFI_TRAMPOLINE)
++				if (is_sandboxed) {
++					// mov $0x[prog_type], %r9 (7 bytes)
++					EMIT3_off32(0x49, 0xc7, 0xc1, bpf_prog->type);
++					// movabs $[func addr] %r11 (10 bytes)
++					EMIT2_off64(0x49, 0xBB, (u64)func);
++					// 17 bytes for copying the prog_type
++					// and helper function address
++					sandbox_ilen = 17;
++					func = (u8 *)&sandbox_tramp;
++				}
++			#endif /* CONFIG_BPF_SANDBOX_CTX || CONFIG_BPF_SFI_TRAMPOLINE */
++			/*** SANDBOX BPF END ***/
+ 			if (tail_call_reachable) {
+ 				/* mov rax, qword ptr [rbp - rounded_stack_depth - 8] */
+ 				EMIT3_off32(0x48, 0x8B, 0x85,
+@@ -1549,8 +1774,10 @@ st:			if (is_imm8(insn->off))
+ 					return -EINVAL;
+ 				offs = x86_call_depth_emit_accounting(&prog, func);
+ 			}
+-			if (emit_call(&prog, func, image + addrs[i - 1] + offs))
++			/*** SANDBOX BPF START ***/
++			if (emit_call(&prog, func, image + addrs[i - 1] + offs + sandbox_ilen))
+ 				return -EINVAL;
++			/*** SANDBOX BPF END ***/
+ 			break;
+ 		}
+ 
+@@ -1808,6 +2035,14 @@ st:			if (is_imm8(insn->off))
+ 			/* Update cleanup_addr */
+ 			ctx->cleanup_addr = proglen;
+ 			pop_callee_regs(&prog, callee_regs_used);
++			/*** SANDBOX BPF START ***/
++			#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++				if (is_sandboxed) {
++					/* mov rbp, -(0x18+BPF_SANDBOX_SIZE-1)(rbp) (restore rbp) */
++					EMIT3_off32(0x48, 0x8B, 0xAD, ORIG_RSP_OFFSET_FROM_RBP);
++				}
++			#endif
++			/*** SANDBOX BPF END ***/
+ 			EMIT1(0xC9);         /* leave */
+ 			emit_return(&prog, image + addrs[i - 1] + (prog - temp));
+ 			break;
+@@ -2456,6 +2691,18 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 	int pass;
+ 	int i;
+ 
++	/*** SANDBOX BPF START ***/
++	struct inst_info info = {
++		.progtype = prog->type,
++		.addrmask = 0,
++		.tramp = 0,
++	};
++
++	#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	bpf_sandbox_map_info_init(prog);
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++	/*** SANDBOX BPF END ***/
++
+ 	if (!prog->jit_requested)
+ 		return orig_prog;
+ 
+@@ -2518,7 +2765,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 	for (pass = 0; pass < MAX_PASSES || image; pass++) {
+ 		if (!padding && pass >= PADDING_PASSES)
+ 			padding = true;
+-		proglen = do_jit(prog, addrs, image, rw_image, oldproglen, &ctx, padding);
++		proglen = do_jit(prog, addrs, image, rw_image, oldproglen, &ctx, padding, &info);
+ 		if (proglen <= 0) {
+ out_image:
+ 			image = NULL;
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 5bd6ac047..90b2707ad 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -58,6 +58,9 @@ extern struct kobject *btf_kobj;
+ extern struct bpf_mem_alloc bpf_global_ma;
+ extern bool bpf_global_ma_set;
+ 
++/* BPF program can access up to 512 bytes of stack space. */
++#define MAX_BPF_STACK	512
++
+ typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
+ typedef int (*bpf_iter_init_seq_priv_t)(void *private_data,
+ 					struct bpf_iter_aux_info *aux);
+@@ -272,7 +275,23 @@ struct bpf_map {
+ 	} owner;
+ 	bool bypass_spec_v1;
+ 	bool frozen; /* write-once; write-protected by freeze_mutex */
++	/*** SANDBOX BPF START ***/
++	#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++	u64 sandbox_or_mask;
++	u64 sandbox_and_mask;
++	#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++	/*** SANDBOX BPF END ***/
++};
++
++/*** SANDBOX BPF START ***/
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++struct bpf_sandbox_map_jit_info {
++	bool is_map_lookup_invoked;
++	unsigned long *map_reg_bitmap;
++	struct bpf_map *current_active_map;
+ };
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++/*** SANDBOX BPF END ***/
+ 
+ static inline const char *btf_field_type_name(enum btf_field_type type)
+ {
+@@ -1396,6 +1415,11 @@ struct bpf_prog {
+ 					    const struct bpf_insn *insn);
+ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
++	unsigned long *ctx_read_write_bitmap;
++	unsigned long *ctx_write_bitmap;
++	#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	struct bpf_sandbox_map_jit_info *map_info;
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
+ 	/* Instructions for interpreter */
+ 	union {
+ 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
+diff --git a/include/linux/bpf_ctx.h b/include/linux/bpf_ctx.h
+new file mode 100644
+index 000000000..3aeb1d629
+--- /dev/null
++++ b/include/linux/bpf_ctx.h
+@@ -0,0 +1,187 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++#ifndef _BPF_CTX_H
++#define _BPF_CTX_H
++
++#include <linux/bpf.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/perf_event.h>
++#include <linux/bpf_malloc.h>
++
++#include <net/xdp.h>
++#include <net/sock.h>
++#include <net/busy_poll.h>
++#include <net/sch_generic.h>
++
++// Compressing the bitmap representation by sizeof(__u32) aka 4 bytes won't
++// work because some fields are __u8 1 byte
++#define BITMAP_COMPRESSION 4 // compressable because all fields are __u32
++#define XDP_BITMAP_SIZE 6
++#define PERF_EVENT_BITMAP_SIZE 32
++#define SOCKET_FILTER_BITMAP_SIZE 64
++
++#ifdef CONFIG_BPF_SANDBOX_CTX
++
++#define IS_SANDBOX_CTX_SUPPORTED(type) ( \
++		type == BPF_PROG_TYPE_SOCKET_FILTER \
++		|| type == BPF_PROG_TYPE_PERF_EVENT \
++		|| type == BPF_PROG_TYPE_XDP \
++		|| type == BPF_PROG_TYPE_KPROBE \
++		)
++
++/**
++ * Maintenance Note: New fields can be added to the BPF contexts (i.e., more
++ *				   fields in the kernel data structure can be exposed to
++ *				   BPF programs), but only at the end of the structure.
++ *				   When porting to a newer kernel version, simply check if
++ *				   any new fields are added to the end of the BPF context.
++ **/
++
++/**
++ * Maintenance Note: A mirror of the structs defined in <linux/filter.h>
++ *				   is defined here to avoid the circular dependency hell.
++ *				   When porting to a different kernel version, update these.
++ **/
++struct bpf_skb_data_end_mirror {
++	struct qdisc_skb_cb qdisc_cb;
++	void *data_meta;
++	void *data_end;
++};
++
++/**
++ * bpf_create_sk_filter_ctx() - copy corresponding fields in __sk_buff from sk_buff.
++ *
++ * @prog: BPF prog structure
++ * @kernel_ctx: the actual kernel object (struct sk_buff)
++ * @bpf_ctx: the BPF mirror of sk_buff (struct __sk_buff)
++ **/
++void bpf_create_sk_filter_ctx(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx);
++
++void bpf_create__sk_buff_tstamp_read(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx);
++
++void bpf_create__sk_buff_tstamp_type(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx);
++
++void bpf_create_bpf_sock_skc(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct bpf_sock *bpf_sk);
++
++void bpf_create__sk_buff_bpf_sock(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx);
++/**
++ * bpf_create_perf_event_ctx() - copy fields
++ *								 in bpf_perf_event_data_kern
++ *								 to bpf_perf_event_data.
++ *
++ * @prog: BPF prog structure
++ * @kernel_ctx: the actual kernel obj (struct bpf_perf_event_data_kern)
++ * @bpf_ctx: the BPF mirror of kernel obj (struct bpf_perf_event_data)
++ **/
++void bpf_create_perf_event_ctx(const struct bpf_prog *prog,
++	const struct bpf_perf_event_data_kern *kernel_ctx,
++	struct bpf_perf_event_data *bpf_ctx);
++
++/**
++ * bpf_create_xdp_ctx() - copy fields
++ *						in xdp_buff
++ *						to xdp_md.
++ *
++ * @prog: BPF prog structure
++ * @kernel_ctx: the actual kernel obj (struct xdp_buff)
++ * @bpf_ctx: the BPF mirror of kernel obj (struct xdp_md)
++ **/
++void bpf_create_xdp_ctx(const struct bpf_prog *prog,
++	const struct xdp_buff *kernel_ctx,
++	struct xdp_md *bpf_ctx);
++
++/**
++ * bpf_sync_sk_filter_ctx() - copy writeable fields in __sk_buff to sk_buff.
++ *
++ * @prog: BPF prog structure
++ * @kernel_ctx: the actual kernel object (struct sk_buff)
++ * @bpf_ctx: the BPF mirror of sk_buff (struct __sk_buff)
++ **/
++void bpf_sync_sk_filter_ctx(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx);
++
++/**
++ * bpf_sync_xdp_ctx() - copy writeable fields in xdp_md to xdp_buff.
++ *
++ * @prog: BPF prog structure
++ * @kernel_ctx: the actual kernel object (struct xdp_buff)
++ * @bpf_ctx: the BPF mirror of sk_buff (struct xdp_md)
++ **/
++void bpf_sync_xdp_ctx(const struct bpf_prog *prog,
++	const struct xdp_buff *kernel_ctx, struct xdp_md *bpf_ctx);
++
++/**
++ * bpf_create_prog_ctx() - eBPF programs can only access limited fields
++ *						 in the kernel data structure (e.g., __sk_buff
++ *						 is a user accessible mirror of the in-kernel
++ *						   sk_buff). This function creates the context
++ *						 that eBPF programs actually interacts with
++ *						   (e.g., __sk_buff) at runtime.
++ *
++ * @prog_type: program type ID
++ * @kernel_ctx: kernel data structure
++ * @bpf_ctx: BPF mirror of the kernel data structure
++ **/
++void bpf_create_prog_ctx(const struct bpf_prog *prog,
++	const void *kernel_ctx, void *bpf_ctx);
++
++/**
++ * bpf_sync_kernel_ctx() - eBPF programs have write access to limited
++ *						   fields in the kernel data structure. This
++ *						   function must be called upon the return
++ *						   of eBPF program to sync any writes back
++ *						   to the actual kernel data structure.
++ *
++ * @prog_type: program type ID
++ * @kernel_ctx: kernel data structure
++ * @bpf_ctx: BPF mirror of the kernel data structure
++ **/
++void bpf_sync_kernel_ctx(const struct bpf_prog *prog,
++	const void *kernel_ctx, void *bpf_ctx);
++
++#endif  /* CONFIG_BPF_SANDBOX_CTX */
++
++/**
++ * record_ctx_accesses() - record which fields are accessed by the program.
++ *						   This function is called when at during
++ *						   post-verification rewrite (i.e, is_valid_accesses
++ *						   is already called so all the fields recorded here
++ *						   are valid accesses.)
++ *
++ * @verifier_env: BPF verifier environment
++ **/
++void record_ctx_accesses(void *verifier_env);
++
++static inline void __bpf_ctx_bitmap_alloc(struct bpf_prog *prog, int nbits)
++{
++	prog->ctx_read_write_bitmap = bitmap_zalloc(nbits, GFP_KERNEL);
++	prog->ctx_write_bitmap = bitmap_zalloc(nbits, GFP_KERNEL);
++}
++
++static inline void bpf_ctx_bitmap_alloc(struct bpf_prog *prog, int type)
++{
++	switch (type) {
++	case BPF_PROG_TYPE_XDP:
++		__bpf_ctx_bitmap_alloc(prog, XDP_BITMAP_SIZE);
++		break;
++	case BPF_PROG_TYPE_SOCKET_FILTER:
++		__bpf_ctx_bitmap_alloc(prog, SOCKET_FILTER_BITMAP_SIZE);
++		break;
++	case BPF_PROG_TYPE_PERF_EVENT:
++		__bpf_ctx_bitmap_alloc(prog, PERF_EVENT_BITMAP_SIZE);
++		break;
++	default:
++		// pr_info("BPF Sandbox: bitmap not supported for prog type %d", type);
++		break;
++	}
++}
++
++#endif  /* _BPF_CTX_H */
+diff --git a/include/linux/bpf_malloc.h b/include/linux/bpf_malloc.h
+new file mode 100644
+index 000000000..8bfa799ae
+--- /dev/null
++++ b/include/linux/bpf_malloc.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++#ifndef _BPF_MALLOC_H
++#define _BPF_MALLOC_H
++
++#include <linux/types.h>
++
++void *bpf_sandbox_get_kernel_ptr(u64 sandbox_ptr);
++void *bpf_malloc(size_t size, void *to_sync);
++void bpf_free(void *sandbox_ptr);
++#endif
+diff --git a/include/linux/bpf_map.h b/include/linux/bpf_map.h
+new file mode 100644
+index 000000000..f2bf92d3c
+--- /dev/null
++++ b/include/linux/bpf_map.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++#ifndef _BPF_MAP_H
++#define _BPF_MAP_H
++
++#include <linux/bpf.h>
++#include <linux/bitmap.h>
++
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++
++#define MAP_BITMAP_SIZE 32
++
++#define IS_MASKING_ENABLED_FOR_MAP(type) ( \
++		type == BPF_MAP_TYPE_ARRAY \
++		|| type == BPF_MAP_TYPE_HASH \
++		)
++
++/**
++ * bpf_sandbox_map_info_init() - initialize the structure to keep
++ *								 track of registers for map masking.
++ *
++ * @prog: BPF prog structure
++ **/
++static inline void bpf_sandbox_map_info_init(struct bpf_prog *prog)
++{
++	if (!prog->map_info) {
++		prog->map_info = kmalloc(sizeof(struct bpf_sandbox_map_jit_info), GFP_KERNEL);
++		prog->map_info->map_reg_bitmap = bitmap_zalloc(MAP_BITMAP_SIZE, GFP_KERNEL);
++	} else {
++		memset(prog->map_info, 0, sizeof(struct bpf_sandbox_map_jit_info));
++		bitmap_clear(prog->map_info->map_reg_bitmap, 0, MAP_BITMAP_SIZE);
++	}
++}
++
++/**
++ * is_map_reg() - checks if a register contains a map value by
++ *					  checking the bitmap stored in BPF prog.
++ *
++ * @prog: BPF prog structure
++ * @reg: register to be checked if it contains a map value
++ **/
++static inline bool is_map_reg(const struct bpf_prog *prog, u8 reg)
++{
++	int bit;
++
++	for (bit = 0; bit < MAP_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->map_info->map_reg_bitmap, MAP_BITMAP_SIZE, bit);
++		if (bit == reg) {
++			// pr_info("BPF MAP: bit = %d, reg = %d", bit, reg);
++			return true;
++		}
++	}
++
++	return false;
++}
++
++void bpf_sandbox_add_map(struct bpf_map *map);
++void bpf_sandbox_delete_map(struct bpf_map *map);
++void bpf_sandbox_add_map_lookup(const struct bpf_map_ops *ops);
++// NOTE: we don't support deletion of lookup func because even
++// when a map is freed, there could be other maps of the same type
++bool is_active_map(u64 map);
++bool is_map_lookup(u64 fn);
++
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++#endif
+diff --git a/include/linux/bpf_mte.h b/include/linux/bpf_mte.h
+new file mode 100644
+index 000000000..b7ade71d4
+--- /dev/null
++++ b/include/linux/bpf_mte.h
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++#ifndef _BPF_MTE_H
++#define _BPF_MTE_H
++
++#include <linux/bpf.h>
++#include <linux/math.h>
++// #include <linux/bitops.h>
++
++#ifdef CONFIG_BPF_SANDBOX_MTE
++
++#include <asm/memory.h>
++#include <asm/cpufeature.h>
++#include <asm/mte-kasan.h>
++
++#define BPF_MTE_TAG_KERNEL	0xFF /* native kernel pointers tag */
++#define BPF_MTE_TAG_SANDBOX 0xFA
++#define BPF_MTE_GRANULE_MASK (MTE_GRANULE_SIZE - 1)
++
++#define bpf_mte_get_tag(addr)	((__u8)((u64)(addr) >> 56))
++
++#ifndef CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG
++
++#define bpf_mte_set_tag(addr, tag)	((void *)__tag_set(addr, tag))
++#define bpf_mte_reset_tag(addr)	__untagged_addr(addr)
++
++#else /* CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG */
++
++#define __a_tag_shifted(tag)	((u64)(tag) << 56)
++#define __a_untagged_addr(addr)	\
++	((__force __typeof__(addr))sign_extend64((__force u64)(addr), 55))
++
++static inline const void *__a_tag_set(const void *addr, u8 tag)
++{
++	u64 __addr = (u64)addr & ~__a_tag_shifted(0xff);
++
++	return (const void *)(__addr | __a_tag_shifted(tag));
++}
++
++#define bpf_mte_set_tag(addr, tag)	((void *)__a_tag_set(addr, tag))
++#define bpf_mte_reset_tag(addr)	__a_untagged_addr(addr)
++
++extern int tag_clobber_memory[4];
++
++// NOTE: This is an early implementation that doesn't use dc gva
++static inline void __a_mte_set_mem_tag_range(void *addr, size_t size, u8 tag,
++					 bool init)
++{
++	u64 curr, end;
++
++	if (!size)
++		return;
++
++	curr = (u64)__a_tag_set(addr, tag);
++	end = curr + size;
++
++	/*
++	 * 'asm volatile' is required to prevent the compiler to move
++	 * the statement outside of the loop.
++	 */
++	do {
++		asm volatile(__MTE_PREAMBLE
++					 "ldr x16, =tag_clobber_memory\n\t"
++					 "mov x17, %0\n\t"
++					 "lsr x17, x17, #49\n\t"
++					 "str %0, [x16]\n\t"
++					:
++					: "r" (curr)
++					: "memory");
++		curr += MTE_GRANULE_SIZE;
++		} while (curr != end);
++}
++
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG */
++
++/**
++ * bpf_mte_tag_mem - tag the memory with the MTE tag embedded in addr
++ * @addr - range start address, must be aligned to MTE_GRANULE_MASK
++ * @size - range size, can be unaligned
++ * @init - whether to initialize the memory range (zeroing)
++ */
++static inline void bpf_mte_tag_mem(const void *addr, size_t size, bool init)
++{
++	u8 tag;
++
++#ifndef CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG
++	if (!system_supports_mte())
++		return;
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG */
++
++	tag = bpf_mte_get_tag(addr);
++
++	// pr_info("BPF MTE: tagged_addr = %llx, tag = %d", (u64)addr, tag);
++
++	addr = bpf_mte_reset_tag(addr);
++
++	// pr_info("BPF MTE: untagged addr = %llx", (u64)addr);
++
++#ifdef CONFIG_BPF_SANDBOX_MTE_TAG_CTX
++	if ((unsigned long)addr & BPF_MTE_GRANULE_MASK) {
++		addr = (const void *)((u64)addr ^ ((u64)addr & BPF_MTE_GRANULE_MASK));
++		size += MTE_GRANULE_SIZE;
++	}
++#endif /* CONFIG_BPF_SANDBOX_MTE_TAG_CTX */
++	if (WARN_ON((unsigned long)addr & BPF_MTE_GRANULE_MASK))
++		return;
++	size = round_up(size, MTE_GRANULE_SIZE);
++
++#ifndef CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG
++	mte_set_mem_tag_range((void *)addr, size, tag, init);
++#else
++	__a_mte_set_mem_tag_range((void *)addr, size, tag, init);
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG */
++}
++
++/**
++ * bpf_mte_tag_ctx - tag the ctx, including the pointers within
++ *
++ * @prog - bpf prog structure
++ * @ctx - pointer to ctx, assume alignment to MTE_GRANULE_MASK
++ * @size - range size, can be unaligned
++ * @tag - tag
++ * @init - whether to initialize the memory range (zeroing)
++ */
++void bpf_mte_tag_ctx(const struct bpf_prog *prog, const void *ctx,
++					size_t size, u8 tag, bool init);
++
++#else
++
++#define bpf_mte_set_tag(addr, tag)	(addr)
++#define bpf_mte_reset_tag(addr)	(addr)
++
++#endif /* CONFIG_BPF_SANDBOX_MTE */
++
++#endif  /* _BPF_MTE_H */
+diff --git a/include/linux/bpf_sandbox.h b/include/linux/bpf_sandbox.h
+new file mode 100644
+index 000000000..d0771b2c3
+--- /dev/null
++++ b/include/linux/bpf_sandbox.h
+@@ -0,0 +1,342 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2023 University of British Columbia
++ *
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ *
++ */
++
++#ifndef _BPF_SANDBOX_H
++#define _BPF_SANDBOX_H
++
++#include <linux/bpf.h>
++#include <linux/bpf_ctx.h>
++#include <linux/bpf_mte.h>
++#include <linux/hashtable.h>
++#include <asm/bpf_sandbox.h>
++
++#ifdef CONFIG_BPF_SANDBOX
++
++#define BPF_SANDBOX_SIZE (PAGE_SIZE / 2)
++#define BPF_SANDBOX_INFO_SIZE (PAGE_SIZE / 2)
++#define BPF_SANDBOX_TOTAL_SIZE sizeof(union bpf_sandbox)
++// mask offset from the top of private memory (i.e., at the end of the 'metadata' page)
++#define BPF_SANDBOX_OR_MASK_OFFSET -8
++#define BPF_SANDBOX_AND_MASK_OFFSET -16
++// orginal rsp offset from the top of private memory (i.e., at the end of 'metadata' page)
++#define BPF_SANDBOX_ORIG_RSP_OFFSET -24
++// orginal ctx offset from the top of private memory (i.e., at the end of 'metadata' page)
++#define BPF_SANDBOX_KERN_CTX_OFFSET -32
++// map masks offset from the top of private memory (i.e., at the end of 'metadata' page)
++#define BPF_SANDBOX_MAP_OR_MASK_OFFSET -40
++#define BPF_SANDBOX_MAP_AND_MASK_OFFSET -48
++// offsets from sandbox base pointer (%rbp), used by the JIT compiler to emit code
++#define OR_MASK_OFFSET_FROM_RBP  ((u32)BPF_SANDBOX_OR_MASK_OFFSET - (BPF_SANDBOX_SIZE - 1))
++#define AND_MASK_OFFSET_FROM_RBP  ((u32)BPF_SANDBOX_AND_MASK_OFFSET - (BPF_SANDBOX_SIZE - 1))
++#define ORIG_RSP_OFFSET_FROM_RBP  ((u32)BPF_SANDBOX_ORIG_RSP_OFFSET - (BPF_SANDBOX_SIZE - 1))
++#define MAP_OR_MASK_OFFSET_FROM_RBP  ((u32)BPF_SANDBOX_MAP_OR_MASK_OFFSET - (BPF_SANDBOX_SIZE - 1))
++#define MAP_AND_MASK_OFFSET_FROM_RBP  ((u32)BPF_SANDBOX_MAP_AND_MASK_OFFSET - \
++									   (BPF_SANDBOX_SIZE - 1))
++#define MAX_SYNC_PAIRS 10
++
++// Reserve 16 bytes in the stack for storing counters
++#define RESERVE_TWO     16
++// Counter offset in the stack
++#define MEMCOUNT_OFFSET         8
++#define TRAMPCOUNT_OFFSET       16
++
++#define current_sandbox (&sandboxes[smp_processor_id()])
++#define current_sandbox_info (&current_sandbox->info)
++#ifdef CONFIG_BPF_SANDBOX_MTE
++#define current_sandbox_mem ((void *)bpf_mte_set_tag(current_sandbox->mem.private, \
++							BPF_MTE_TAG_SANDBOX))
++#else
++#define current_sandbox_mem  ((void *)current_sandbox->mem.private)
++#endif /* CONFIG_BPF_SANDBOX_MTE */
++
++#define IS_SANDBOX_ENABLED(type) ( \
++		type == BPF_PROG_TYPE_SOCKET_FILTER \
++		|| type == BPF_PROG_TYPE_XDP \
++		|| type == BPF_PROG_TYPE_KPROBE \
++		)
++
++/**
++ * struct bpf_sandbox_sync - stores memory addresses to enable synchronization between
++ * sandbox and kernel
++ *
++ * @sandbox_ptr: pointer to sandbox memory address
++ * @kernel_ptr: pointer to kernel memory address
++ */
++struct bpf_sandbox_sync {
++	u64	sandbox_ptr;
++	u64	kernel_ptr;
++};
++
++/**
++ * struct bpf_sandbox_info - stores bpf sandbox environment information
++ *
++ * @prog_brk: end of the data segment
++ * @stack_end: end address of the stack in private memory
++ * @free_size: amount of unallocated memory available
++ * @sync_pairs: holds bpf_sandbox_sync elements
++ * @or_mask: or_mask unique to the sandbox
++ */
++struct bpf_sandbox_info {
++	/* Dynamic allocation metadata */
++	u64			prog_brk;
++	u64			stack_end;
++	u64			free_size;
++	struct bpf_sandbox_sync sync_pairs[MAX_SYNC_PAIRS];
++	/* Address Mask */
++	u64			or_mask;
++	/* Original Kernel Ctx */
++	u64			kern_ctx;
++};
++
++/**
++ * struct bpf_sandbox_mem - components of sandbox memory
++ *
++ * @raw_info: array for storing sandbox info
++ * @private: array for private sandbox memory
++ */
++struct bpf_sandbox_mem {
++	u8 raw_info[BPF_SANDBOX_INFO_SIZE];
++	u8 private[BPF_SANDBOX_SIZE];
++};
++
++/**
++ * union bpf_sandbox - field that points to either sandbox info or memory
++ *
++ * @info: stores bpf sandbox environment information
++ * @mem: sandbox raw info and private memory
++ */
++union bpf_sandbox {
++	struct bpf_sandbox_info info;
++	struct bpf_sandbox_mem	mem;
++};
++
++extern size_t bpf_ctx_size_map[]; //TODO: can be removed
++extern uintptr_t bpf_sandbox_and_mask;
++extern union bpf_sandbox *sandboxes;
++extern void *sandbox_ctx;
++
++/**
++ * init_sandbox_env() - initializes sandbox environments
++ *
++ * @verifier_env: bpf verification environment
++ */
++void init_sandbox_env(void *verifier_env);
++
++/**
++ * sandbox_tramp() - checks validity of helper function before calling
++ */
++#if defined(CONFIG_X86_64)
++u64 sandbox_tramp(void);
++#elif defined(CONFIG_ARM64)
++void sandbox_tramp(volatile u64 r1, volatile u64 r2, volatile u64 r3, volatile u64 r4,
++		volatile u64 r5);
++#endif
++
++/**
++ * record_map_ops() - Keeps track of valid map operations (for CFI)
++ */
++void record_map_ops(u64 prog_id, const struct bpf_map_ops *ops);
++
++/**
++ * msb() - gets the position of the most significant set bit
++ *
++ * @b: size of memory allocated in number of bytes
++ *
++ * Return: the position of the msb starting from 0
++ */
++static __always_inline int msb(int b)
++{
++	int p = 0;
++
++	b = b / 2;
++	while (b != 0) {
++		b = b / 2;
++		p++;
++	}
++	return p;
++}
++
++/**
++ * gen_or_mask() - calculates an OR mask based on pointer p and size s
++ *
++ * @p: void pointer
++ * @s: size in number of bytes
++ *
++ * Return: Returns an address aligned to the boundary provided by s
++ */
++static __always_inline uintptr_t gen_or_mask(volatile void *p, size_t s)
++{
++	uintptr_t m = (((uintptr_t)1 << (msb(s) + 1)) - 1) - s;
++
++	return (uintptr_t)p & ~m;
++}
++
++/**
++ * gen_and_mask() - calculates an AND mask based on size s
++ *
++ * @s: size in number of bytes
++ *
++ * Return: Returns an address where the highest bit is set to the msb and
++ * there are 's' trailing zeros
++ */
++static __always_inline uintptr_t gen_and_mask(size_t s)
++{
++	uintptr_t m = (((uintptr_t)1 << (msb(s) + 1)) - 1) - s;
++
++	return (uintptr_t)m;
++}
++
++/**
++ * is_caller_sandboxed() - checks if the caller is sandboxed
++ *                         (called within helper functions)
++ *
++ * Return: Returns true if the caller eBPF program is sandboxed,
++ *         false otherwise
++ */
++static __always_inline bool is_caller_sandboxed(void)
++{
++#if defined(CONFIG_BPF_SFI_TRAMPOLINE) || defined(CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT)
++	u8 prog_id;
++
++#if defined(CONFIG_X86_64) || defined(CONFIG_ARM64)
++	prog_id = bpf_helper_get_prog_type();
++	return IS_SANDBOX_ENABLED(prog_id);
++#else
++	panic("BPF Sandbox: Architecture not supported");
++#endif         /* CONFIG_X86_64 or CONFIG_ARM64 */
++
++	return false;
++#else /* CONFIG_BPF_SFI_TRAMPOLINE or CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++	return false;
++#endif /* CONFIG_BPF_SFI_TRAMPOLINE or CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++}
++
++#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++/**
++ * bpf_sandbox_init_meminfo() - initializes bpf sandbox information for a given bpf program type
++ *
++ * @sandbox_info: struct containing bpf sandbox environment information
++ * @ctx_size: context size of given bpf program type
++ */
++static void bpf_sandbox_init_meminfo(struct bpf_sandbox_info *sandbox_info, size_t ctx_size)
++{
++	sandbox_info->prog_brk = (uintptr_t)sandbox_info + BPF_SANDBOX_INFO_SIZE + ctx_size;
++	sandbox_info->stack_end = (uintptr_t)sandbox_info + BPF_SANDBOX_INFO_SIZE
++				  + BPF_SANDBOX_SIZE - MAX_BPF_STACK;
++	sandbox_info->free_size = sandbox_info->stack_end - sandbox_info->prog_brk;
++	for (int i = 0; i < MAX_SYNC_PAIRS; i++) {
++		sandbox_info->sync_pairs[i].sandbox_ptr = 0;
++		sandbox_info->sync_pairs[i].kernel_ptr = 0;
++	}
++}
++
++/**
++ * sandbox_alloc() - memory is allocated for a bpf sandbox based on program type and context
++ *
++ * @prog: bpf program pointer
++ * @kernel_ctx: actual kernel context
++ *
++ * If the context pointer is not null, the context size is obtained. Then the
++ * memory information for the specific bpf sandbox is initialized. Next, the
++ * data in context pointer is copied to the current sandbox memory, and the
++ * bpf sandbox memory is configured with the obtained context information.
++ *
++ * If the context pointer is null, the memory information for the specific bpf
++ * sandbox is initialized, and the bpf sandbox memory is configured without
++ * prexisting context information.
++ *
++ * Return: the pointer to the memory address of the allocated sandbox memory
++ */
++static __always_inline void *sandbox_alloc(const struct bpf_prog *prog, const void *kernel_ctx)
++{
++	size_t ctx_size;
++
++	if (kernel_ctx) {
++		ctx_size = bpf_ctx_size_map[prog->type]; // TODO: change this to bpf ctx size
++		current_sandbox_info->kern_ctx = (u64)kernel_ctx;
++		bpf_sandbox_init_meminfo(current_sandbox_info, ctx_size);
++#ifdef CONFIG_BPF_SANDBOX_CTX
++		if (IS_SANDBOX_CTX_SUPPORTED(prog->type))
++			bpf_create_prog_ctx(prog, kernel_ctx, current_sandbox_mem);
++		else
++			memcpy(current_sandbox_mem, kernel_ctx, ctx_size);
++#else
++		memcpy(current_sandbox_mem, kernel_ctx, ctx_size);
++#endif /* CONFIG_BPF_SANDBOX_CTX */
++	} else {
++		bpf_sandbox_init_meminfo(current_sandbox_info, 0);
++	}
++
++	sandbox_ctx = current_sandbox_mem;
++	bpf_sandbox_set_memory(current_sandbox_mem, current_sandbox_info->kern_ctx,
++			       current_sandbox_info->or_mask, bpf_sandbox_and_mask);
++
++	return current_sandbox_mem;
++}
++
++/**
++ * sandbox_free() - Performs ctx syncing and (supposedly sandbox cleanup) upon exit
++ *
++ * @prog: bpf program pointer
++ */
++static __always_inline void sandbox_free(const struct bpf_prog *prog)
++{
++#ifdef CONFIG_BPF_SANDBOX_CTX
++	bpf_sync_kernel_ctx(prog, (void *)current_sandbox_info->kern_ctx, current_sandbox_mem);
++#endif /* CONFIG_BPF_SANDBOX_CTX */
++}
++#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++
++#ifdef CONFIG_BPF_SANDBOX_STACK_MANAGEMENT
++/**
++ * min_sandbox_alloc() - memory is allocated for a bpf stack
++ *
++ * @prog: bpf program pointer
++ * @kernel_ctx: actual kernel context
++ *
++ * If the context exists, the kernel object size is obtained.
++ * We tag the kernel object, including the nested structures being accessed.
++ *
++ * Return: the tagged ctx pointer
++ */
++#ifdef CONFIG_BPF_SANDBOX_MTE_TAG_CTX
++static __always_inline void *min_sandbox_alloc(const struct bpf_prog *prog, const void *ctx)
++{
++	size_t ctx_size = bpf_ctx_size_map[prog->type];
++
++	bpf_mte_tag_ctx(prog, ctx, ctx_size, BPF_MTE_TAG_SANDBOX, false);
++	bpf_sandbox_set_sp(current_sandbox_mem);
++	return bpf_mte_set_tag(ctx, BPF_MTE_TAG_SANDBOX);
++}
++#endif /* CONFIG_BPF_SANDBOX_MTE_TAG_CTX */
++
++#ifndef CONFIG_BPF_SANDBOX_MTE_TAG_CTX
++static __always_inline void *min_sandbox_alloc(const struct bpf_prog *prog, const void *ctx)
++{
++	bpf_sandbox_set_sp(current_sandbox_mem);
++	return (void *)ctx;
++}
++#endif /* CONFIG_BPF_SANDBOX_MTE_TAG_CTX */
++
++/**
++ * min_sandbox_free() - Untag ctx upon exit
++ *
++ * @prog: bpf program pointer
++ */
++static __always_inline void min_sandbox_free(const struct bpf_prog *prog, const void *ctx)
++{
++#ifdef CONFIG_BPF_SANDBOX_MTE_TAG_CTX
++	size_t ctx_size = bpf_ctx_size_map[prog->type];
++
++	bpf_mte_tag_ctx(prog, ctx, ctx_size, BPF_MTE_TAG_KERNEL, false);
++#endif /* CONFIG_BPF_SANDBOX_MTE_TAG_CTX */
++}
++#endif /* CONFIG_BPF_SANDBOX_STACK_MANAGEMENT */
++
++#endif  /* CONFIG_BPF_SANDBOX */
++#endif  /* _BPF_SANDBOX_H */
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 370c96acd..1ed5d4542 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/bpf.h>
++#include <linux/bpf_sandbox.h>
+ #include <linux/refcount.h>
+ #include <linux/compat.h>
+ #include <linux/skbuff.h>
+@@ -83,9 +84,6 @@ struct ctl_table_header;
+  */
+ #define BPF_SYM_ELF_TYPE	't'
+ 
+-/* BPF program can access up to 512 bytes of stack space. */
+-#define MAX_BPF_STACK	512
+-
+ /* Helper macros for filter block array initializers. */
+ 
+ /* ALU ops on registers, bpf_add|sub|...: dst_reg += src_reg */
+@@ -579,12 +577,74 @@ typedef unsigned int (*bpf_dispatcher_fn)(const void *ctx,
+ 					  unsigned int (*bpf_func)(const void *,
+ 								   const struct bpf_insn *));
+ 
++#ifdef CONFIG_BPF_SANDBOX
++static __always_inline u32 __bpf_prog_run_sandboxed(const struct bpf_prog *prog,
++					  const void *ctx,
++					  bpf_dispatcher_fn dfunc)
++{
++	u32 ret;
++	unsigned long flags;
++	#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++	void *sandbox_mem;
++	#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++	#ifdef CONFIG_BPF_SANDBOX_STACK_MANAGEMENT
++	void *tagged_ctx;
++	#endif /* CONFIG_BPF_SANDBOX_STACK_MANAGEMENT */
++
++	local_irq_save(flags);
++	preempt_disable();
++	cant_migrate();
++	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
++		struct bpf_prog_stats *stats;
++		u64 start = sched_clock();
++		unsigned long flags2;
++		#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++			sandbox_mem = sandbox_alloc(prog, ctx);
++			ret = dfunc(sandbox_mem, prog->insnsi, prog->bpf_func);
++			sandbox_free(prog);
++		#elif defined(CONFIG_BPF_SANDBOX_STACK_MANAGEMENT)
++			tagged_ctx = min_sandbox_alloc(prog, ctx);
++			ret = dfunc(tagged_ctx, prog->insnsi, prog->bpf_func);
++			min_sandbox_free(prog, ctx);
++		#else
++			ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
++		#endif
++		stats = this_cpu_ptr(prog->stats);
++		flags2 = u64_stats_update_begin_irqsave(&stats->syncp);
++		u64_stats_inc(&stats->cnt);
++		u64_stats_add(&stats->nsecs, sched_clock() - start);
++		u64_stats_update_end_irqrestore(&stats->syncp, flags2);
++	} else {
++		#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++			sandbox_mem = sandbox_alloc(prog, ctx);
++			ret = dfunc(sandbox_mem, prog->insnsi, prog->bpf_func);
++			sandbox_free(prog);
++		#elif defined(CONFIG_BPF_SANDBOX_STACK_MANAGEMENT)
++			tagged_ctx = min_sandbox_alloc(prog, ctx);
++			ret = dfunc(tagged_ctx, prog->insnsi, prog->bpf_func);
++			min_sandbox_free(prog, ctx);
++		#else
++			ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
++		#endif
++	}
++	local_irq_restore(flags);
++	preempt_enable();
++	return ret;
++}
++#endif /* CONFIG_BPF_SANDBOX */
++
++
+ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
+ 					  const void *ctx,
+ 					  bpf_dispatcher_fn dfunc)
+ {
+ 	u32 ret;
+ 
++	#ifdef CONFIG_BPF_SANDBOX
++		if (IS_SANDBOX_ENABLED(prog->type))
++			return __bpf_prog_run_sandboxed(prog, ctx, dfunc);
++	#endif
++
+ 	cant_migrate();
+ 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
+ 		struct bpf_prog_stats *stats;
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 62ce1f5d1..9e756a96b 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -986,6 +986,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_LSM,
+ 	BPF_PROG_TYPE_SK_LOOKUP,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
++	MAX_BPF_PROG_TYPE,
+ };
+ 
+ enum bpf_attach_type {
+@@ -5968,9 +5969,9 @@ struct __sk_buff {
+ 	__u32 gso_segs;
+ 	__bpf_md_ptr(struct bpf_sock *, sk);
+ 	__u32 gso_size;
+-	__u8  tstamp_type;
+ 	__u32 :24;		/* Padding, future use. */
+ 	__u64 hwtstamp;
++	__u8  tstamp_type;
+ };
+ 
+ struct bpf_tunnel_key {
+@@ -6139,9 +6140,9 @@ enum xdp_action {
+  * new fields must be added to the end of this structure
+  */
+ struct xdp_md {
+-	__u32 data;
+-	__u32 data_end;
+-	__u32 data_meta;
++	__u64 data;
++	__u64 data_end;
++	__u64 data_meta;
+ 	/* Below access go through struct xdp_rxq_info */
+ 	__u32 ingress_ifindex; /* rxq->dev->ifindex */
+ 	__u32 rx_queue_index;  /* rxq->queue_index  */
+diff --git a/kernel/bpf/Kconfig b/kernel/bpf/Kconfig
+index 2dfe1079f..3d2c754be 100644
+--- a/kernel/bpf/Kconfig
++++ b/kernel/bpf/Kconfig
+@@ -99,4 +99,209 @@ config BPF_LSM
+ 
+ 	  If you are unsure how to answer this question, answer N.
+ 
++config BPF_SANDBOX
++	bool "Enable eBPF sandboxing"
++	default y
++	help
++	  Enables support for dynamic sandboxing of eBPF programs.
++
++	  Note: no check is enabled at this point, please select
++	  the sandbox mode (BPF_SANDBOX_SFI or BPF_SANDBOX_MT) to
++	  enable runtime checks.
++
++choice
++	prompt "Sandbox Management"
++	default BPF_SANDBOX_MEMORY_MANAGEMENT
++	help
++	  There are two kinds of sandboxes:
++
++	  1. Memory. This is essentially the full sandbox, i.e., the
++		 stack, context, metadata, is put inside sandbox.
++	  2. Stack. This is the most simple sandbox, where only the stack
++		 is put inside the sandbox.
++
++config BPF_SANDBOX_MEMORY_MANAGEMENT
++	bool "Full Sandbox"
++	depends on BPF_SANDBOX
++	help
++	  Enables eBPF sandbox management. This option allocates one
++	  sandbox per core. At runtime, eBPF programs occupy the sandbox
++	  on the core it execute. Preemption and interrupt are disabled
++	  during eBPF execution.
++
++config BPF_SANDBOX_STACK_MANAGEMENT
++	bool "Minimal Sandbox"
++	depends on BPF_SANDBOX && BPF_SANDBOX_MTE
++	help
++	  Enables eBPF stack management. In contrary to the "memory
++	  management" option, this allocates one sandbox per core but
++	  only puts the stack in the sandbox, the context is tagged as
++	  it is and not moved into the sandbox. Preemption and interrupt
++	  are disabled during eBPF execution.
++
++endchoice
++
++config BPF_SANDBOX_CTX
++	bool "Enable sandboxing support for BPF contexts"
++	depends on BPF_SANDBOX && BPF_SANDBOX_MEMORY_MANAGEMENT
++	default y
++	help
++	  Enables sandboxing support for eBPF contexts. This includes
++	  replacing the load-time context access conversions with
++	  run-time BPF context creation, swapping the context pointers
++	  in helper functions, and syncing writes to contexts upon exit.
++
++choice
++	prompt "Context Mode"
++	depends on BPF_SANDBOX_CTX
++	default BPF_SANDBOX_CTX_GENERIC
++	help
++	  There are two modes for initializing BPF contexts in the sandbox
++	  (i.e., copying the fields in kernel objects to the BPF context):
++
++	  1. Generic. Copy every field in a BPF context from its kernel object.
++	  2. Bitmap. Use a bitmap to keep track of the fields accessed by an
++		 eBPF program. Copy only those fields from the kernel object.
++
++config BPF_SANDBOX_CTX_GENERIC
++	bool "All fields"
++	depends on BPF_SANDBOX_CTX
++	help
++	  Enables sandboxing support for eBPF contexts. This includes
++	  replacing the load-time context access conversions with
++	  run-time BPF context creation, swapping the context pointers
++	  in helper functions, and syncing writes to contexts upon exit.
++
++config BPF_SANDBOX_CTX_BITMAP
++	bool "Only the fields being accessed"
++	depends on BPF_SANDBOX_CTX
++	help
++	  Enables sandboxing support for eBPF contexts. This includes
++	  replacing the load-time context access conversions with
++	  run-time BPF context creation, swapping the context pointers
++	  in helper functions, and syncing writes to contexts upon exit.
++
++endchoice
++
++choice
++	prompt "Sandbox Mode"
++	default BPF_SANDBOX_SFI
++	help
++	  There are two modes for sandboxing BPF programs:
++
++	  1. Software-based isolation via address masking (x86_64 and ARM64).
++		 Enabled with CONFIG_BPF_SANDBOX_SFI.
++	  2. Hardware-based isolation via MTE (only for ARM64). Enabled with
++		 CONFIG_BPF_SANDBOX_MTE.
++
++config BPF_SANDBOX_MTE
++	bool "MTE"
++	depends on BPF_SANDBOX && ARM64_MTE
++	help
++	  Enables sandboxing of eBPF programs by leveraging ARM Memory Tagging
++	  Extension (MTE). When the sandboxes are initialized at each core,
++	  they are assigned an allocation tag. During JIT compilation, every
++	  pointer is rewritten with a logical tag associated to its sandbox.
++
++config BPF_SANDBOX_SFI
++	bool "SFI"
++	depends on BPF_SANDBOX
++	select BPF_SANDBOX_MEMORY_MANAGEMENT
++	help
++	  Enables sandboxing of eBPF programs by leveraging software-based
++	  address masking. This can be used in x86_64 and ARM64 architectures.
++	  Each sandbox is associated with a unique mask. During JIT compilation,
++	  load/store instructions are instrumented with address masking checks.
++
++endchoice
++
++config BPF_SFI_TRAMPOLINE
++	bool "Enable control-flow integrity checks for eBPF"
++	depends on BPF_SANDBOX_SFI
++	default y
++	help
++	  Enables control-flow integrity checks on all call instructions
++	  within eBPF programs. This option leverages a trampoline
++	  mechanism to prevent eBPF programs from achieving
++	  arbitrary code execution.
++
++config BPF_SFI_MASK_WRITE
++	bool "Emit SFI address masking checks for writes in eBPF"
++	depends on BPF_SANDBOX_SFI && BPF_SANDBOX_MEMORY_MANAGEMENT
++	default y
++	help
++	  Enables address masking on all write instructions
++	  within eBPF programs. This option prevents out-of-bounds
++	  memory accesses by restricting all memory accesses to within
++	  the eBPF sandbox.
++
++config BPF_SFI_MASK_READ
++	bool "Emit SFI address masking checks for reads in eBPF"
++	depends on BPF_SANDBOX_SFI && BPF_SANDBOX_MEMORY_MANAGEMENT
++	default y
++	help
++	  Enables address masking on all read instructions
++	  within eBPF programs. This option prevents out-of-bounds
++	  memory accesses by restricting all memory accesses to within
++	  the eBPF sandbox.
++
++config BPF_SFI_MAP_MASKING
++	bool "Enable SFI address masking for BPF maps"
++	depends on BPF_SANDBOX_SFI && BPF_SANDBOX_MEMORY_MANAGEMENT
++	default y
++	help
++	  Enables address masking on all BPF map accesses.
++	  This option generates a unique mask for each BPF map,
++	  and tracks the register during JIT compilation to identify
++	  registers containing BPF maps.
++
++config BPF_SFI_MASK_MAP_READ_WRITE
++	bool "Emit SFI address masking checks for read/write in BPF map"
++	depends on BPF_SANDBOX_SFI && BPF_SFI_MAP_MASKING
++	depends on BPF_SFI_MASK_READ || BPF_SFI_MASK_WRITE
++	default y
++	help
++	  Enables address masking on all BPF map read/write instructions.
++	  Once enabled, the JIT compiler will emit address masking
++	  instructions that involve a register containing a BPF map.
++	  If a particular map type is not yet supported, no address
++	  masking instructions will be emitted on those map accesses.
++
++config BPF_SANDBOX_MTE_TAG_CTX
++	bool "Enable MTE tagging of eBPF context"
++	depends on BPF_SANDBOX_MTE && BPF_SANDBOX_STACK_MANAGEMENT
++	help
++	  Enables the analogs for MTE instructions. This option simulate the tagging
++	  of memory, and MTE tag checking, which involves two main operations:
++	  tag loading and tag comparison. The latter has negligible overhead so this
++	  simulation focuses on tag loading.
++
++config BPF_SANDBOX_MTE_ANALOG_TAG
++	bool "Enable MTE analog for tagging"
++	depends on BPF_SANDBOX_MTE
++	help
++	  Enables the analogs for MTE instructions. This option simulate the tagging
++	  of memory, and MTE tag checking, which involves two main operations:
++	  tag loading and tag comparison. The latter has negligible overhead so this
++	  simulation focuses on tag loading.
++
++config BPF_SANDBOX_MTE_ANALOG_LOAD
++	bool "Enable MTE analog for tag loading"
++	depends on BPF_SANDBOX_MTE
++	help
++	  Enables the analogs for MTE instructions. This option simulate the tagging
++	  of memory, and MTE tag checking, which involves two main operations:
++	  tag loading and tag comparison. The latter has negligible overhead so this
++	  simulation focuses on tag loading.
++
++config BPF_MEASURE_SANDBOX_INSTRUMENTATION
++	bool "Enable measurement of SFI instrumentation"
++	depends on BPF_SANDBOX_SFI && !BPF_SFI_TRAMPOLINE && !BPF_SANDBOX_MEMORY_MANAGEMENT
++	default n
++	help
++	  Enables measurement of SFI instrumentation. This option
++	  outputs the number of checks inserted during JIT compilation,
++	  and the number of checks executed by the sandboxed eBPF
++	  program to dmesg.
++
+ endmenu # "BPF subsystem"
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index 02242614d..7bf300c26 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -44,3 +44,5 @@ obj-$(CONFIG_BPF_PRELOAD) += preload/
+ obj-$(CONFIG_BPF_SYSCALL) += relo_core.o
+ $(obj)/relo_core.o: $(srctree)/tools/lib/bpf/relo_core.c FORCE
+ 	$(call if_changed_rule,cc_o_c)
++
++obj-$(CONFIG_BPF_SANDBOX) += sandbox.o malloc.o map.o ctx.o ctx_bitmap.o mte.o
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index cb80bcc88..2e7659b40 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -12,6 +12,9 @@
+ #include <uapi/linux/btf.h>
+ #include <linux/rcupdate_trace.h>
+ #include <linux/btf_ids.h>
++#include <linux/bpf_sandbox.h>
++#include <linux/bpf_map.h>
++#include <linux/bpf_mte.h>
+ 
+ #include "map_in_map.h"
+ 
+@@ -85,6 +88,14 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 	bool bypass_spec_v1 = bpf_bypass_spec_v1();
+ 	u64 array_size, mask64;
+ 	struct bpf_array *array;
++	void *data;
++
++	/*** SANDBOX BPF START ***/
++	#if defined(CONFIG_BPF_SFI_MAP_MASKING) || defined(CONFIG_BPF_SANDBOX_MTE)
++	u64 total_elem_size;
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++	/*** SANDBOX BPF END ***/
++
+ 
+ 	elem_size = round_up(attr->value_size, 8);
+ 
+@@ -109,9 +120,36 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 			return ERR_PTR(-E2BIG);
+ 	}
+ 
++	/*** SANDBOX BPF START ***/
++	#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	// TODO: current implementation does not support total_elem_size > 1 page
++	// addr 0x9000, or_mask 0x8000, and_mask 0x1fff
++	total_elem_size = percpu ?
++					__roundup_pow_of_two((u64) max_entries * sizeof(void *)) :
++					__roundup_pow_of_two((u64) max_entries * elem_size);
++
++	array_size = PAGE_ALIGN(sizeof(*array)) + PAGE_ALIGN(total_elem_size);
++	data = attr->map_flags & BPF_F_MMAPABLE ?
++			bpf_map_area_mmapable_alloc(array_size, numa_node) :
++			bpf_map_area_alloc(array_size, numa_node);
++
++	if (!data)
++		return ERR_PTR(-ENOMEM);
++
++	array = data + PAGE_ALIGN(sizeof(struct bpf_array))
++		- offsetof(struct bpf_array, value);
++
++	#else /* CONFIG_BPF_SFI_MAP_MASKING */
+ 	array_size = sizeof(*array);
++
+ 	if (percpu) {
++		#ifdef CONFIG_BPF_SANDBOX_MTE
++		total_elem_size = round_up((u64) max_entries * sizeof(void *),
++									MTE_GRANULE_SIZE);
++		array_size += total_elem_size;
++		#else
+ 		array_size += (u64) max_entries * sizeof(void *);
++		#endif /* CONFIG_BPF_SANDBOX_MTE */
+ 	} else {
+ 		/* rely on vmalloc() to return page-aligned memory and
+ 		 * ensure array->value is exactly page-aligned
+@@ -119,15 +157,22 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 		if (attr->map_flags & BPF_F_MMAPABLE) {
+ 			array_size = PAGE_ALIGN(array_size);
+ 			array_size += PAGE_ALIGN((u64) max_entries * elem_size);
++			#ifdef CONFIG_BPF_SANDBOX_MTE
++			total_elem_size = PAGE_ALIGN((u64) max_entries * elem_size);
++			#endif /* CONFIG_BPF_SANDBOX_MTE */
+ 		} else {
++			#ifdef CONFIG_BPF_SANDBOX_MTE
++			total_elem_size = round_up((u64) max_entries * elem_size,
++									BPF_MTE_GRANULE_MASK);
++			array_size += total_elem_size;
++			#else
+ 			array_size += (u64) max_entries * elem_size;
++			#endif /* CONFIG_BPF_SANDBOX_MTE */
+ 		}
+ 	}
+ 
+ 	/* allocate all map elements and zero-initialize them */
+ 	if (attr->map_flags & BPF_F_MMAPABLE) {
+-		void *data;
+-
+ 		/* kmalloc'ed memory can't be mmap'ed, use explicit vmalloc */
+ 		data = bpf_map_area_mmapable_alloc(array_size, numa_node);
+ 		if (!data)
+@@ -137,6 +182,9 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 	} else {
+ 		array = bpf_map_area_alloc(array_size, numa_node);
+ 	}
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++	/*** SANDBOX BPF END ***/
++
+ 	if (!array)
+ 		return ERR_PTR(-ENOMEM);
+ 	array->index_mask = index_mask;
+@@ -151,6 +199,22 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
++	/*** SANDBOX BPF START ***/
++	#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	bpf_sandbox_add_map(&array->map);
++	array->map.sandbox_or_mask = gen_or_mask(array->value, total_elem_size);
++	array->map.sandbox_and_mask = gen_and_mask(total_elem_size);
++	// pr_info("BPF: value at %llx, total_elem_size = %lld or %llx",
++	//		(u64)array->value, total_elem_size, total_elem_size);
++	// pr_info("BPF: or_mask = %llx, and_mask = %llx",
++	//		array->map.sandbox_or_mask, array->map.sandbox_and_mask);
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++	#ifdef CONFIG_BPF_SANDBOX_MTE
++	bpf_mte_tag_mem(bpf_mte_set_tag((void *)array->value, BPF_MTE_TAG_SANDBOX),
++					total_elem_size, true);
++	#endif /* CONFIG_BPF_SANDBOX_MTE */
++	/*** SANDBOX BPF END ***/
++
+ 	return &array->map;
+ }
+ 
+@@ -168,7 +232,8 @@ static void *array_map_lookup_elem(struct bpf_map *map, void *key)
+ 	if (unlikely(index >= array->map.max_entries))
+ 		return NULL;
+ 
+-	return array->value + (u64)array->elem_size * (index & array->index_mask);
++	return bpf_mte_set_tag((void *)(array->value + (u64)array->elem_size *
++					(index & array->index_mask)), BPF_MTE_TAG_SANDBOX);
+ }
+ 
+ static int array_map_direct_value_addr(const struct bpf_map *map, u64 *imm,
+@@ -435,10 +500,18 @@ static void array_map_free(struct bpf_map *map)
+ 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+ 		bpf_array_free_percpu(array);
+ 
++	/*** SANDBOX BPF START ***/
++	#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	bpf_sandbox_delete_map(map);
++	// Round down to free the extra space we over-allocated
++	bpf_map_area_free(array_map_vmalloc_addr(array));
++	#else
+ 	if (array->map.map_flags & BPF_F_MMAPABLE)
+ 		bpf_map_area_free(array_map_vmalloc_addr(array));
+ 	else
+ 		bpf_map_area_free(array);
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++	/*** SANDBOX BPF END ***/
+ }
+ 
+ static void array_map_seq_show_elem(struct bpf_map *map, void *key,
+@@ -786,7 +859,14 @@ static void fd_array_map_free(struct bpf_map *map)
+ 	for (i = 0; i < array->map.max_entries; i++)
+ 		BUG_ON(array->ptrs[i] != NULL);
+ 
++	/*** SANDBOX BPF START ***/
++	#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	// Round down to free the extra space we over-allocated
++	bpf_map_area_free(array_map_vmalloc_addr(array));
++	#else
+ 	bpf_map_area_free(array);
++	#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++	/*** SANDBOX BPF END ***/
+ }
+ 
+ static void *fd_array_map_lookup_elem(struct bpf_map *map, void *key)
+diff --git a/kernel/bpf/ctx.c b/kernel/bpf/ctx.c
+new file mode 100644
+index 000000000..a6172610a
+--- /dev/null
++++ b/kernel/bpf/ctx.c
+@@ -0,0 +1,383 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++
++
++#include <linux/bpf_ctx.h>
++
++#ifdef CONFIG_BPF_SANDBOX_CTX
++
++void bpf_create__sk_buff_tstamp_read(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	#ifdef CONFIG_NET_CLS_ACT
++		if (!prog->tstamp_type_access) {
++			memcpy(&bpf_ctx->tstamp, kernel_ctx->__pkt_vlan_present_offset,
++					sizeof(__u64));
++			bpf_ctx->tstamp = bpf_ctx->tstamp &
++							(TC_AT_INGRESS_MASK |
++							SKB_MONO_DELIVERY_TIME_MASK);
++			if (bpf_ctx->tstamp
++				== (TC_AT_INGRESS_MASK | SKB_MONO_DELIVERY_TIME_MASK)) {
++				bpf_ctx->tstamp = 0;
++				return;
++			}
++		}
++	#endif /* CONFIG_NET_CLS_ACT */
++	bpf_ctx->tstamp = kernel_ctx->tstamp;
++}
++
++
++void bpf_create__sk_buff_tstamp_type(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	memcpy(&bpf_ctx->tstamp_type, kernel_ctx->__pkt_vlan_present_offset, sizeof(__u8));
++	if (bpf_ctx->tstamp_type > SKB_MONO_DELIVERY_TIME_MASK) {
++		bpf_ctx->tstamp_type = BPF_SKB_TSTAMP_UNSPEC;
++		return;
++	}
++	bpf_ctx->tstamp_type = BPF_SKB_TSTAMP_DELIVERY_MONO;
++}
++
++void bpf_create_bpf_sock_skc(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct bpf_sock *bpf_sk)
++{
++	struct sock_common *skc = &kernel_ctx->sk->__sk_common;
++
++	if (skc && virt_addr_valid(skc)) {
++		bpf_sk->family = skc->skc_family; //check
++		bpf_sk->src_ip4 = skc->skc_rcv_saddr; //check
++		bpf_sk->dst_ip4 = skc->skc_daddr; //check
++		bpf_sk->src_port = skc->skc_num;
++		bpf_sk->dst_port = skc->skc_dport;
++		bpf_sk->state = skc->skc_state;
++		#if IS_ENABLED(CONFIG_IPV6)
++			memcpy(bpf_sk->dst_ip6, skc->skc_v6_daddr.s6_addr32, 4*sizeof(__u32));
++			memcpy(bpf_sk->src_ip6, skc->skc_v6_rcv_saddr.s6_addr32,
++					4*sizeof(__u32));
++		#else
++			memset(bpf_sk->dst_ip6, 0, 4*sizeof(__u32));
++			memset(bpf_sk->src_ip6, 0, 4*sizeof(__u32));
++		#endif /* CONFIG_IPV6 */
++	}
++}
++
++void bpf_create__sk_buff_bpf_sock(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct sock *kernel_sk = kernel_ctx->sk;
++
++	if (kernel_sk && virt_addr_valid(kernel_sk)) {
++		bpf_ctx->sk = bpf_malloc(sizeof(struct bpf_sock), NULL);
++
++		bpf_ctx->sk->bound_dev_if = kernel_sk->sk_bound_dev_if;
++		bpf_ctx->sk->type = kernel_sk->sk_type;
++		bpf_ctx->sk->protocol = kernel_sk->sk_protocol;
++		bpf_ctx->sk->mark = kernel_sk->sk_mark;
++		bpf_ctx->sk->priority = kernel_sk->sk_priority;
++		bpf_ctx->sk->rx_queue_mapping = kernel_sk->sk_rx_queue_mapping;
++		bpf_create_bpf_sock_skc(prog, kernel_ctx, bpf_ctx->sk);
++	} else
++		bpf_ctx->sk = NULL; // for NULL testing on the user's end
++}
++
++#ifdef CONFIG_BPF_SANDBOX_CTX_GENERIC
++
++static void bpf_create__sk_buff_shinfo(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct skb_shared_info *shinfo;
++
++	#ifdef NET_SKBUFF_DATA_USES_OFFSET
++		shinfo = skb_shinfo(kernel_ctx);
++	#else
++		*shinfo = kernel_ctx->end; //check
++	#endif /* NET_SKBUFF_DATA_USES_OFFSET */
++
++	if (shinfo && virt_addr_valid(shinfo)) {
++		bpf_ctx->gso_segs = shinfo->gso_segs;
++		bpf_ctx->gso_size = shinfo->gso_size;
++		//not accessible by socket filter (NOT TESTED)
++		bpf_ctx->hwtstamp = shinfo->hwtstamps.hwtstamp;
++	}
++}
++
++static void bpf_create__sk_buff_skc(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct sock_common *skc = &kernel_ctx->sk->__sk_common;
++
++	if (skc && virt_addr_valid(skc)) {
++		bpf_ctx->family = skc->skc_family; //check
++		bpf_ctx->remote_port = skc->skc_dport;
++		#ifndef __BIG_ENDIAN_BITFIELD
++		bpf_ctx->remote_port = bpf_ctx->remote_port << 16;
++		#endif /* __BIG_ENDIAN_BITFIELD */
++		bpf_ctx->local_port = skc->skc_num;
++		bpf_ctx->remote_ip4 = skc->skc_daddr; //check
++		bpf_ctx->local_ip4 = skc->skc_rcv_saddr; //check
++		#if IS_ENABLED(CONFIG_IPV6)
++			memcpy(bpf_ctx->remote_ip6, skc->skc_v6_daddr.s6_addr32, 4*sizeof(__u32));
++			memcpy(bpf_ctx->local_ip6, skc->skc_v6_rcv_saddr.s6_addr32,
++					4*sizeof(__u32));
++		#else
++			memset(bpf_ctx->remote_ip6, 0, 4*sizeof(__u32));
++			memset(bpf_ctx->local_ip6, 0, 4*sizeof(__u32));
++		#endif /* CONFIG_IPV6 */
++	}
++}
++
++static void bpf_create__sk_buff_qdisc_cb(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct qdisc_skb_cb *qdisc_cb = qdisc_skb_cb(kernel_ctx);
++
++	if (qdisc_cb && virt_addr_valid(qdisc_cb)) {
++		memcpy(bpf_ctx->cb, qdisc_cb->data, 5*sizeof(__u32)); //pass
++		//not accessible by socket filter (NOT TESTED)
++		bpf_ctx->tc_classid = qdisc_cb->tc_classid;
++		bpf_ctx->wire_len = qdisc_cb->pkt_len; //check
++	}
++}
++
++static void bpf_create__sk_buff_netdev(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct net_device *netdev = kernel_ctx->dev;
++
++	if (netdev && virt_addr_valid(netdev))
++		bpf_ctx->ifindex = netdev->ifindex;
++}
++
++static void bpf_create__sk_buff_bpf_skb_data_end(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct bpf_skb_data_end_mirror *bpf_skb_data;
++
++	bpf_skb_data = (struct bpf_skb_data_end_mirror *)kernel_ctx->cb;
++
++	if (bpf_skb_data && virt_addr_valid(bpf_skb_data)) {
++		bpf_ctx->data_meta = (__u32)(u64) bpf_skb_data->data_meta;
++		bpf_ctx->data_end = (__u32)(u64) bpf_skb_data->data_end;
++	}
++}
++
++void bpf_create_sk_filter_ctx(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	//TODO: keep a simplified copy of convert_ctx_access,
++	//	  with cb->access=1 and all those BUILD_BUG_ON
++	//TODO: as we move target_size in convert_ctx_access needs to be kept
++
++	bpf_ctx->len = kernel_ctx->len; //pass
++	bpf_ctx->protocol = kernel_ctx->protocol; //pass
++	bpf_ctx->vlan_proto = kernel_ctx->vlan_proto; //pass
++	bpf_ctx->priority = kernel_ctx->priority; //pass
++	bpf_ctx->ingress_ifindex = kernel_ctx->skb_iif; //pass
++	bpf_ctx->hash = kernel_ctx->hash; //pass
++	bpf_ctx->mark = kernel_ctx->mark; //pass
++	bpf_ctx->queue_mapping = kernel_ctx->queue_mapping; //pass
++	bpf_ctx->vlan_tci = kernel_ctx->vlan_tci; //pass
++	bpf_ctx->vlan_present = kernel_ctx->vlan_all != 0 ? 1 : kernel_ctx->vlan_all; //pass
++
++	bpf_ctx->pkt_type = kernel_ctx->__pkt_type_offset[0] & PKT_TYPE_MAX; //pass
++	#ifdef __BIG_ENDIAN_BITFIELD
++		bpf_ctx->pkt_type = bpf_ctx->pkt_type >> 5;
++	#endif /* __BIG_ENDIAN_BITFIELD */
++
++	//not accessible by socket filter (NOT TESTED)
++	if (kernel_ctx->data && virt_addr_valid(kernel_ctx->data))
++	   memcpy(&bpf_ctx->data, kernel_ctx->data, sizeof(__u32));
++
++	#ifdef CONFIG_NET_SCHED
++		bpf_ctx->tc_index = kernel_ctx->tc_index; //pass
++	#else
++		bpf_ctx->tc_index = 0;
++	#endif /* CONFIG_NET_SCHED */
++
++	#ifdef CONFIG_NET_RX_BUSY_POLL
++		bpf_ctx->napi_id = kernel_ctx->napi_id; //pass? (zero matches)
++		if (bpf_ctx->napi_id < MIN_NAPI_ID)
++			bpf_ctx->napi_id = 0;
++	#else
++		bpf_ctx->napi_id = 0;
++	#endif /* CONFIG_NET_RX_BUSY_POLL */
++
++	//not accessible by socket filter (NOT TESTED)
++	bpf_create__sk_buff_tstamp_read(prog, kernel_ctx, bpf_ctx);
++	//not accessible by socket filter (NOT TESTED)
++	bpf_create__sk_buff_tstamp_type(prog, kernel_ctx, bpf_ctx);
++
++	//not accessible by socket filter (NOT TESTED)
++	bpf_create__sk_buff_skc(prog, kernel_ctx, bpf_ctx);
++	bpf_create__sk_buff_shinfo(prog, kernel_ctx, bpf_ctx);
++	//pass (to test again with convert_ctx_accesses removed)
++	bpf_create__sk_buff_netdev(prog, kernel_ctx, bpf_ctx);
++	//not accessible by socket filter (NOT TESTED)
++	bpf_create__sk_buff_qdisc_cb(prog, kernel_ctx, bpf_ctx);
++	//not accessible by socket filter (NOT TESTED)
++	bpf_create__sk_buff_bpf_skb_data_end(prog, kernel_ctx, bpf_ctx);
++
++	// TODO: malloc tested, but the field values not verified
++	bpf_create__sk_buff_bpf_sock(prog, kernel_ctx, bpf_ctx);
++
++	/********************************************/
++	// pr_info("----------------------------------");
++	// pr_info("len = %d, protocol = %d, vlan_proto = %d",
++	//		bpf_ctx->len, bpf_ctx->protocol, bpf_ctx->vlan_proto);
++	// pr_info("priority = %d, ingress_ifindex = %d, hash = %d",
++	//		bpf_ctx->priority, bpf_ctx->ingress_ifindex, bpf_ctx->hash);
++	// pr_info("mark = %d, queue_mapping = %d, vlan_tci = %d",
++	//		bpf_ctx->mark, bpf_ctx->queue_mapping, bpf_ctx->vlan_tci);
++	// pr_info("pkt_type = %d, vlan_present = %d, tc_index = %d",
++	//		bpf_ctx->pkt_type, bpf_ctx->vlan_present, bpf_ctx->tc_index);
++	// pr_info("ifindex = %d, napi_id = %d, tstamp = %lld, tstamp_type = %d",
++	//		bpf_ctx->ifindex, bpf_ctx->napi_id, bpf_ctx->tstamp, bpf_ctx->tstamp_type);
++	// pr_info("gso_segs = %d, gso_size = %d", bpf_ctx->gso_segs, bpf_ctx->gso_size);
++	// pr_info("actual sk_buff = %llx, __sk_buff = %llx, sock = %llx, bpf_ctx = %llx",
++	//		(u64)kernel_ctx, (u64)bpf_ctx, (u64)bpf_ctx->sk, (u64)bpf_ctx);
++	// pr_info("sk->bound = %llx, sk->family = %llx",
++	//		(u64)&bpf_ctx->sk->bound_dev_if, (u64)&bpf_ctx->sk->family);
++	/********************************************/
++}
++
++void bpf_create_perf_event_ctx(const struct bpf_prog *prog,
++	const struct bpf_perf_event_data_kern *kernel_ctx,
++	struct bpf_perf_event_data *bpf_ctx)
++{
++	bpf_ctx->sample_period = kernel_ctx->data->period;
++	bpf_ctx->addr = kernel_ctx->data->addr;
++	memcpy(&bpf_ctx->regs, kernel_ctx->regs,
++					sizeof(bpf_user_pt_regs_t));
++
++	/********************************************/
++	// pr_info("----------------------------------");
++	// pr_info("period = %lld, addr = %llx",
++	//		bpf_ctx->sample_period, bpf_ctx->addr);
++	/********************************************/
++}
++
++void bpf_create_xdp_ctx(const struct bpf_prog *prog,
++	const struct xdp_buff *kernel_ctx,
++	struct xdp_md *bpf_ctx)
++{
++	void *xdp_data, *xdp_metadata;
++	struct xdp_rxq_info *rxq = kernel_ctx->rxq;
++	struct xdp_txq_info *txq = kernel_ctx->txq;
++	int data_size_bit = (u64)kernel_ctx->data_end - (u64)kernel_ctx->data;
++	int metadata_size_bit = (u64)kernel_ctx->data - (u64)kernel_ctx->data_meta;
++
++	// No need to null check, bpf_malloc panics if there's not enough space
++	if (metadata_size_bit > 0) {
++		xdp_metadata = bpf_malloc(metadata_size_bit, NULL);
++		memcpy(xdp_metadata, kernel_ctx->data_meta, metadata_size_bit);
++	}
++
++	xdp_data = bpf_malloc(data_size_bit, NULL);
++	memcpy(xdp_data, kernel_ctx->data, data_size_bit);
++
++	bpf_ctx->data = (u64)xdp_data;
++	bpf_ctx->data_end = bpf_ctx->data + data_size_bit;
++	bpf_ctx->data_meta = metadata_size_bit > 0 ? (u64)xdp_metadata :
++						 bpf_ctx->data;
++
++	// pr_info("BPF Sandbox: xdp_kdata = %llx, xdp_kend = %llx, xdp_kmeta = %llx",
++	//		(u64)kernel_ctx->data, (u64)kernel_ctx->data_end,
++	//		(u64)kernel_ctx->data_meta);
++	// pr_info("BPF Sandbox: xdp_data = %lx, xdp_end = %lx, xdp_meta = %lx",
++	//		bpf_ctx->data, bpf_ctx->data_end, bpf_ctx->data_meta);
++	// struct ethhdr *khdr = (struct ethhdr *)kernel_ctx->data;
++	// struct ethhdr *hdr = (struct ethhdr *)bpf_ctx->data;
++	// pr_info("BPF Sandbox: xdp_k_proto = %d, xdp_proto = %d",
++	//		khdr->h_proto, hdr->h_proto);
++	// pr_info("BPF Sandbox: size of data in sandbox = %d, size of ethhdr = %d",
++	//		data_size_bit, sizeof(struct ethhdr));
++
++	if (rxq && virt_addr_valid(rxq)) {
++		bpf_ctx->ingress_ifindex = (rxq->dev && virt_addr_valid(rxq->dev)) ?
++									rxq->dev->ifindex : 0;
++		bpf_ctx->rx_queue_index = rxq->queue_index;
++	}
++
++	if (txq && virt_addr_valid(txq))
++		bpf_ctx->egress_ifindex = (txq->dev && virt_addr_valid(txq->dev)) ?
++									txq->dev->ifindex : 0;
++}
++
++void bpf_sync_sk_filter_ctx(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	struct qdisc_skb_cb *qdisc_cb = qdisc_skb_cb(kernel_ctx);
++
++	if (qdisc_cb && virt_addr_valid(qdisc_cb))
++		memcpy(qdisc_cb->data, bpf_ctx->cb, 5*sizeof(__u32));
++}
++
++void bpf_sync_xdp_ctx(const struct bpf_prog *prog,
++	const struct xdp_buff *kernel_ctx, struct xdp_md *bpf_ctx)
++{
++	struct xdp_rxq_info *rxq = kernel_ctx->rxq;
++
++	if (bpf_prog_is_offloaded(prog->aux) && rxq && virt_addr_valid(rxq))
++		rxq->queue_index = bpf_ctx->rx_queue_index;
++
++}
++
++#endif /* CONFIG_BPF_SANDBOX_CTX_GENERIC */
++
++// No need for bitmap implementation
++void bpf_create_kprobe_ctx(const struct bpf_prog *prog,
++	const void *kernel_ctx, void *bpf_ctx)
++{
++	// NOTE: not tested on x86_64
++	memcpy(bpf_ctx, kernel_ctx, sizeof(bpf_user_pt_regs_t));
++}
++
++void bpf_create_prog_ctx(const struct bpf_prog *prog,
++	const void *kernel_ctx, void *bpf_ctx)
++{
++	switch (prog->type) {
++	case BPF_PROG_TYPE_SOCKET_FILTER:
++		bpf_create_sk_filter_ctx(prog, kernel_ctx, bpf_ctx);
++		break;
++	case BPF_PROG_TYPE_PERF_EVENT:
++		bpf_create_perf_event_ctx(prog, kernel_ctx, bpf_ctx);
++		break;
++	case BPF_PROG_TYPE_XDP:
++		bpf_create_xdp_ctx(prog, kernel_ctx, bpf_ctx); // pass
++		break;
++	case BPF_PROG_TYPE_KPROBE:
++		bpf_create_kprobe_ctx(prog, kernel_ctx, bpf_ctx);
++		break;
++	default:
++		// pr_info_once("BPF Sandbox: ctx support not yet added for prog type %d",
++				// prog->type);
++		break;
++	}
++}
++EXPORT_SYMBOL(bpf_create_prog_ctx);
++
++void bpf_sync_kernel_ctx(const struct bpf_prog *prog,
++	const void *kernel_ctx, void *bpf_ctx)
++{
++	switch (prog->type) {
++	case BPF_PROG_TYPE_SOCKET_FILTER:
++		bpf_sync_sk_filter_ctx(prog, kernel_ctx, bpf_ctx);
++		break;
++	case BPF_PROG_TYPE_XDP:
++		bpf_sync_xdp_ctx(prog, kernel_ctx, bpf_ctx); // pass
++		break;
++	case BPF_PROG_TYPE_PERF_EVENT:
++		break;	// no writes allowed, no syncing required upon exit
++	case BPF_PROG_TYPE_KPROBE:
++		break; // no writes allowed, no syncing required upon exit
++	default:
++		// pr_info("BPF Sandbox: ctx support not yet added for prog type %d",
++				// prog->type);
++		break;
++	}
++}
++EXPORT_SYMBOL(bpf_sync_kernel_ctx);
++
++#endif  /* CONFIG_BPF_SANDBOX_CTX */
+diff --git a/kernel/bpf/ctx_bitmap.c b/kernel/bpf/ctx_bitmap.c
+new file mode 100644
+index 000000000..b673151f3
+--- /dev/null
++++ b/kernel/bpf/ctx_bitmap.c
+@@ -0,0 +1,372 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++
++#include <linux/bpf_verifier.h>
++#include <linux/bpf_ctx.h>
++#include <linux/bitmap.h>
++
++void record_ctx_accesses(void *verifier_env)
++{
++	const struct bpf_verifier_env *env = verifier_env;
++	const int insn_cnt = env->prog->len;
++	struct bpf_insn *insn = env->prog->insnsi;
++	enum bpf_access_type type;
++	bool ctx_access;
++	int i, bit;
++
++	for (i = 0; i < insn_cnt; i++, insn++) {
++		if ((int)env->insn_aux_data[i].ptr_type != PTR_TO_CTX)
++			continue;
++
++		if (insn->code == (BPF_LDX | BPF_MEM | BPF_B) ||
++		    insn->code == (BPF_LDX | BPF_MEM | BPF_H) ||
++		    insn->code == (BPF_LDX | BPF_MEM | BPF_W) ||
++		    insn->code == (BPF_LDX | BPF_MEM | BPF_DW)) {
++			type = BPF_READ;
++			ctx_access = true;
++		} else if (insn->code == (BPF_STX | BPF_MEM | BPF_B) ||
++			   insn->code == (BPF_STX | BPF_MEM | BPF_H) ||
++			   insn->code == (BPF_STX | BPF_MEM | BPF_W) ||
++			   insn->code == (BPF_STX | BPF_MEM | BPF_DW) ||
++			   insn->code == (BPF_ST | BPF_MEM | BPF_B) ||
++			   insn->code == (BPF_ST | BPF_MEM | BPF_H) ||
++			   insn->code == (BPF_ST | BPF_MEM | BPF_W) ||
++			   insn->code == (BPF_ST | BPF_MEM | BPF_DW)) {
++			type = BPF_WRITE;
++			ctx_access = BPF_CLASS(insn->code) == BPF_STX;
++		} else {
++			continue;
++		}
++
++		if (!ctx_access)
++			continue;
++
++		bit = insn->off / BITMAP_COMPRESSION;
++
++		if (!env->prog->ctx_read_write_bitmap || !env->prog->ctx_write_bitmap)
++			return;
++
++		switch (type) {
++		case BPF_READ:
++			bitmap_set(env->prog->ctx_read_write_bitmap, bit, 1);
++			// pr_info("read field at offset %d", bit);
++			break;
++		case BPF_WRITE:
++			bitmap_set(env->prog->ctx_read_write_bitmap, bit, 1);
++			bitmap_set(env->prog->ctx_write_bitmap, bit, 1);
++			// pr_info("write field at offset %d", bit);
++			break;
++		}
++	}
++
++}
++
++#ifdef CONFIG_BPF_SANDBOX_CTX
++#ifdef CONFIG_BPF_SANDBOX_CTX_BITMAP
++/**
++ * Maintenance Note: move the __u8 tstamp_type to the last field
++ **/
++void bpf_create_sk_filter_ctx(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	int offset, bit;
++	struct bpf_skb_data_end_mirror *bpf_skb_data;
++	struct sock_common *skc = &kernel_ctx->sk->__sk_common;
++	struct qdisc_skb_cb *qdisc_cb = qdisc_skb_cb(kernel_ctx);
++
++	// if (bitmap_empty(prog->ctx_read_write_bitmap, SOCKET_FILTER_BITMAP_SIZE))
++	//	return;
++
++	for (bit = 0; bit < SOCKET_FILTER_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_read_write_bitmap, SOCKET_FILTER_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++		// pr_info("CTX SK_FILTER: bit = %d", bit);
++
++		// if (bit == SOCKET_FILTER_BITMAP_SIZE)
++		//	break;
++
++		switch (offset)	{
++		case offsetof(struct __sk_buff, len):
++			bpf_ctx->len = kernel_ctx->len;
++			break;
++		case offsetof(struct __sk_buff, protocol):
++			bpf_ctx->protocol = kernel_ctx->protocol;
++			break;
++		case offsetof(struct __sk_buff, vlan_proto):
++			bpf_ctx->vlan_proto = kernel_ctx->vlan_proto;
++			break;
++		case offsetof(struct __sk_buff, priority):
++			bpf_ctx->priority = kernel_ctx->priority;
++			break;
++		case offsetof(struct __sk_buff, ingress_ifindex):
++			bpf_ctx->ingress_ifindex = kernel_ctx->skb_iif;
++			break;
++		case offsetof(struct __sk_buff, ifindex):
++			bpf_ctx->ifindex = kernel_ctx->dev->ifindex;
++			break;
++		case offsetof(struct __sk_buff, hash):
++			bpf_ctx->hash = kernel_ctx->hash;
++			break;
++		case offsetof(struct __sk_buff, mark):
++			bpf_ctx->mark = kernel_ctx->mark;
++			break;
++		case offsetof(struct __sk_buff, pkt_type):
++			bpf_ctx->pkt_type = kernel_ctx->__pkt_type_offset[0] & PKT_TYPE_MAX;
++			#ifdef __BIG_ENDIAN_BITFIELD
++			bpf_ctx->pkt_type = bpf_ctx->pkt_type >> 5;
++			#endif /* __BIG_ENDIAN_BITFIELD */
++			break;
++		case offsetof(struct __sk_buff, queue_mapping):
++			bpf_ctx->queue_mapping = kernel_ctx->queue_mapping;
++			break;
++		case offsetof(struct __sk_buff, vlan_present):
++			bpf_ctx->vlan_present = kernel_ctx->vlan_all != 0 ?
++									1 : kernel_ctx->vlan_all;
++			break;
++		case offsetof(struct __sk_buff, vlan_tci):
++			bpf_ctx->vlan_tci = kernel_ctx->vlan_tci;
++			break;
++		case offsetof(struct __sk_buff, data):
++			memcpy(&bpf_ctx->data, kernel_ctx->data, sizeof(__u32));
++			break;
++		case offsetof(struct __sk_buff, tc_index):
++			#ifdef CONFIG_NET_SCHED
++			bpf_ctx->tc_index = kernel_ctx->tc_index; //pass
++			#else
++			bpf_ctx->tc_index = 0;
++			#endif /* CONFIG_NET_SCHED */
++			break;
++		case offsetof(struct __sk_buff, napi_id):
++			#ifdef CONFIG_NET_RX_BUSY_POLL
++			bpf_ctx->napi_id = kernel_ctx->napi_id; //pass? (zero matches)
++			if (bpf_ctx->napi_id < MIN_NAPI_ID)
++				bpf_ctx->napi_id = 0;
++			#else
++			bpf_ctx->napi_id = 0;
++			#endif /* CONFIG_NET_RX_BUSY_POLL */
++			break;
++		/* qdisc_skb_cb */
++		case offsetof(struct __sk_buff, cb[0]) ...
++			 offsetofend(struct __sk_buff, cb[4]) - 1:
++			memcpy(bpf_ctx->cb, qdisc_cb->data, 5*sizeof(__u32));
++			break;
++		case offsetof(struct __sk_buff, tc_classid):
++			bpf_ctx->tc_classid = qdisc_cb->tc_classid;
++			break;
++		case offsetof(struct __sk_buff, wire_len):
++			bpf_ctx->wire_len = qdisc_cb->pkt_len;
++			break;
++		/* bpf_skb_data_end */
++		case offsetof(struct __sk_buff, data_meta):
++			bpf_skb_data = (struct bpf_skb_data_end_mirror *)kernel_ctx->cb;
++			bpf_ctx->data_meta = (__u32)(u64) bpf_skb_data->data_meta;
++			break;
++		case offsetof(struct __sk_buff, data_end):
++			bpf_skb_data = (struct bpf_skb_data_end_mirror *)kernel_ctx->cb;
++			bpf_ctx->data_end = (__u32)(u64) bpf_skb_data->data_end;
++			break;
++		/* sock_common */
++		case offsetof(struct __sk_buff, family):
++			bpf_ctx->family = skc->skc_family;
++			break;
++		case offsetof(struct __sk_buff, remote_ip4):
++			bpf_ctx->remote_ip4 = skc->skc_daddr;
++			break;
++		case offsetof(struct __sk_buff, local_ip4):
++			bpf_ctx->local_ip4 = skc->skc_rcv_saddr;
++			break;
++		case offsetof(struct __sk_buff, remote_ip6[0]) ...
++			 offsetof(struct __sk_buff, remote_ip6[3]):
++			#if IS_ENABLED(CONFIG_IPV6)
++			memcpy(bpf_ctx->remote_ip6, skc->skc_v6_daddr.s6_addr32, 4*sizeof(__u32));
++			#else
++			memset(bpf_ctx->remote_ip6, 0, 4*sizeof(__u32));
++			#endif /* CONFIG_IPV6 */
++			break;
++		case offsetof(struct __sk_buff, local_ip6[0]) ...
++			 offsetof(struct __sk_buff, local_ip6[3]):
++			#if IS_ENABLED(CONFIG_IPV6)
++			memcpy(bpf_ctx->local_ip6, skc->skc_v6_rcv_saddr.s6_addr32,
++					4*sizeof(__u32));
++			#else
++			memset(bpf_ctx->local_ip6, 0, 4*sizeof(__u32));
++			#endif /* CONFIG_IPV6 */
++			break;
++		case offsetof(struct __sk_buff, remote_port):
++			bpf_ctx->remote_port = skc->skc_dport;
++			#ifndef __BIG_ENDIAN_BITFIELD
++			bpf_ctx->remote_port = bpf_ctx->remote_port << 16;
++			#endif /* __BIG_ENDIAN_BITFIELD */
++			break;
++		case offsetof(struct __sk_buff, local_port):
++			bpf_ctx->local_port = skc->skc_num;
++			break;
++		/* skb_shared_info */
++		case offsetof(struct __sk_buff, gso_segs):
++			#ifdef NET_SKBUFF_DATA_USES_OFFSET
++			bpf_ctx->gso_segs = skb_shinfo(kernel_ctx)->gso_segs;
++			#else
++			*shinfo = kernel_ctx->end;
++			bpf_ctx->gso_segs = shinfo->gso_segs;
++			#endif /* NET_SKBUFF_DATA_USES_OFFSET */
++			break;
++		case offsetof(struct __sk_buff, gso_size):
++			#ifdef NET_SKBUFF_DATA_USES_OFFSET
++			bpf_ctx->gso_size = skb_shinfo(kernel_ctx)->gso_size;
++			#else
++			*shinfo = kernel_ctx->end;
++			bpf_ctx->gso_size = shinfo->gso_size;
++			#endif /* NET_SKBUFF_DATA_USES_OFFSET */
++			break;
++		case offsetof(struct __sk_buff, hwtstamp):
++			#ifdef NET_SKBUFF_DATA_USES_OFFSET
++			bpf_ctx->hwtstamp = skb_shinfo(kernel_ctx)->hwtstamps.hwtstamp;
++			#else
++			*shinfo = kernel_ctx->end;
++			bpf_ctx->hwtstamp = shinfo->hwtstamps.hwtstamp;
++			#endif /* NET_SKBUFF_DATA_USES_OFFSET */
++			break;
++		case offsetof(struct __sk_buff, tstamp):
++			bpf_create__sk_buff_tstamp_read(prog, kernel_ctx, bpf_ctx);
++			break;
++		case offsetof(struct __sk_buff, tstamp_type):
++			bpf_create__sk_buff_tstamp_type(prog, kernel_ctx, bpf_ctx);
++			break;
++		case offsetof(struct __sk_buff, sk):
++			bpf_create__sk_buff_bpf_sock(prog, kernel_ctx, bpf_ctx);
++			break;
++		}
++	}
++}
++
++void bpf_create_perf_event_ctx(const struct bpf_prog *prog,
++	const struct bpf_perf_event_data_kern *kernel_ctx,
++	struct bpf_perf_event_data *bpf_ctx)
++{
++	int offset, bit;
++
++	if (bitmap_empty(prog->ctx_read_write_bitmap, PERF_EVENT_BITMAP_SIZE))
++		return;
++
++	for (bit = 0; bit < PERF_EVENT_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_read_write_bitmap, PERF_EVENT_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++		// pr_info("CTX PERF_EVENT: bit = %d", bit);
++
++		// if (bit == PERF_EVENT_BITMAP_SIZE)
++		//	break;
++
++		switch (offset)	{
++		case offsetof(struct bpf_perf_event_data, sample_period):
++			bpf_ctx->sample_period = kernel_ctx->data->period;
++			break;
++		case offsetof(struct bpf_perf_event_data, addr):
++			bpf_ctx->addr = kernel_ctx->data->addr;
++			break;
++		case offsetof(struct bpf_perf_event_data, regs):
++			memcpy(&bpf_ctx->regs, kernel_ctx->regs,
++					sizeof(bpf_user_pt_regs_t));
++			break;
++		}
++	}
++}
++
++void bpf_create_xdp_ctx(const struct bpf_prog *prog,
++	const struct xdp_buff *kernel_ctx,
++	struct xdp_md *bpf_ctx)
++{
++	int offset, bit;
++	void *xdp_data, *xdp_metadata;
++	struct xdp_rxq_info *rxq = kernel_ctx->rxq;
++	struct xdp_txq_info *txq = kernel_ctx->txq;
++	int data_size_bit = (u64)kernel_ctx->data_end - (u64)kernel_ctx->data;
++	int metadata_size_bit = (u64)kernel_ctx->data - (u64)kernel_ctx->data_meta;
++
++	// if (bitmap_empty(prog->ctx_read_write_bitmap, XDP_BITMAP_SIZE))
++	//	return;
++
++	for (bit = 0; bit < XDP_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_read_write_bitmap, XDP_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++		// pr_info("CTX XDP: bit = %d, offset = %d", bit, offset);
++
++		// if (bit == XDP_BITMAP_SIZE)
++		//	break;
++
++		switch (offset)	{
++		case offsetof(struct xdp_md, data):
++			xdp_data = bpf_malloc(data_size_bit, NULL);
++			memcpy(xdp_data, kernel_ctx->data, data_size_bit);
++			bpf_ctx->data = (u64)xdp_data;
++			break;
++		case offsetof(struct xdp_md, data_meta):
++			if (metadata_size_bit > 0) {
++				xdp_metadata = bpf_malloc(metadata_size_bit, NULL);
++				memcpy(xdp_metadata, kernel_ctx->data_meta, metadata_size_bit);
++				bpf_ctx->data_meta = (u64)xdp_metadata;
++			} else
++				bpf_ctx->data_meta = bpf_ctx->data;
++			break;
++		case offsetof(struct xdp_md, data_end):
++			bpf_ctx->data_end = bpf_ctx->data + data_size_bit;
++			break;
++		case offsetof(struct xdp_md, ingress_ifindex):
++			bpf_ctx->ingress_ifindex = rxq->dev->ifindex;
++			break;
++		case offsetof(struct xdp_md, rx_queue_index):
++			bpf_ctx->rx_queue_index = rxq->queue_index;
++			break;
++		case offsetof(struct xdp_md, egress_ifindex):
++			bpf_ctx->egress_ifindex = txq->dev->ifindex;
++			break;
++		}
++	}
++}
++
++void bpf_sync_sk_filter_ctx(const struct bpf_prog *prog,
++	const struct sk_buff *kernel_ctx, struct __sk_buff *bpf_ctx)
++{
++	int offset, bit;
++	struct qdisc_skb_cb *qdisc_cb;
++
++	// if (bitmap_empty(prog->ctx_write_bitmap, SOCKET_FILTER_BITMAP_SIZE))
++	//	return;
++
++	for (bit = 0; bit < SOCKET_FILTER_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_write_bitmap, SOCKET_FILTER_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++
++		switch (offset)	{
++		case offsetof(struct __sk_buff, cb[0]) ...
++			 offsetofend(struct __sk_buff, cb[4]) - 1:
++			qdisc_cb = qdisc_skb_cb(kernel_ctx);
++			memcpy(qdisc_cb->data, bpf_ctx->cb, 5*sizeof(__u32));
++			break;
++		}
++	}
++}
++
++void bpf_sync_xdp_ctx(const struct bpf_prog *prog,
++	const struct xdp_buff *kernel_ctx, struct xdp_md *bpf_ctx)
++{
++	int offset, bit;
++
++	// if (bitmap_empty(prog->ctx_write_bitmap, XDP_BITMAP_SIZE))
++	//	return;
++
++	for (bit = 0; bit < XDP_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_write_bitmap, XDP_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++
++		switch (offset)	{
++		case offsetof(struct xdp_md, rx_queue_index):
++			kernel_ctx->rxq->queue_index = bpf_ctx->rx_queue_index;
++			break;
++		}
++	}
++}
++
++#endif /* CONFIG_BPF_SANDBOX_CTX_BITMAP */
++#endif  /* CONFIG_BPF_SANDBOX_CTX */
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 519319877..54590f8a2 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -15,6 +15,8 @@
+ #include "bpf_lru_list.h"
+ #include "map_in_map.h"
+ #include <linux/bpf_mem_alloc.h>
++#include <linux/bpf_sandbox.h>
++#include <linux/bpf_map.h>
+ 
+ #define HTAB_CREATE_FLAG_MASK						\
+ 	(BPF_F_NO_PREALLOC | BPF_F_NO_COMMON_LRU | BPF_F_NUMA_NODE |	\
+@@ -231,7 +233,8 @@ static void htab_free_prealloced_timers(struct bpf_htab *htab)
+ 		struct htab_elem *elem;
+ 
+ 		elem = get_htab_elem(htab, i);
+-		bpf_obj_free_timer(htab->map.record, elem->key + round_up(htab->map.key_size, 8));
++		bpf_obj_free_timer(htab->map.record,
++			elem->key + round_up(htab->map.key_size, 16));
+ 		cond_resched();
+ 	}
+ }
+@@ -249,7 +252,8 @@ static void htab_free_prealloced_fields(struct bpf_htab *htab)
+ 		struct htab_elem *elem;
+ 
+ 		elem = get_htab_elem(htab, i);
+-		bpf_obj_free_fields(htab->map.record, elem->key + round_up(htab->map.key_size, 8));
++		bpf_obj_free_fields(htab->map.record,
++			elem->key + round_up(htab->map.key_size, 16));
+ 		cond_resched();
+ 	}
+ }
+@@ -316,7 +320,7 @@ static int prealloc_init(struct bpf_htab *htab)
+ 		goto skip_percpu_elems;
+ 
+ 	for (i = 0; i < num_entries; i++) {
+-		u32 size = round_up(htab->map.value_size, 8);
++		u32 size = round_up(htab->map.value_size, 16);
+ 		void __percpu *pptr;
+ 
+ 		pptr = bpf_map_alloc_percpu(&htab->map, size, 8,
+@@ -492,12 +496,18 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 	/* hash table size must be power of 2 */
+ 	htab->n_buckets = roundup_pow_of_two(htab->map.max_entries);
+ 
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	bpf_sandbox_add_map(&htab->map);
++	if (!is_power_of_2(round_up(htab->map.value_size, 16)))
++		htab->map.value_size = __roundup_pow_of_two(htab->map.value_size);
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
++
+ 	htab->elem_size = sizeof(struct htab_elem) +
+-			  round_up(htab->map.key_size, 8);
++			  round_up(htab->map.key_size, 16);
+ 	if (percpu)
+ 		htab->elem_size += sizeof(void *);
+ 	else
+-		htab->elem_size += round_up(htab->map.value_size, 8);
++		htab->elem_size += round_up(htab->map.value_size, 16);
+ 
+ 	err = -E2BIG;
+ 	/* prevent zero size kmalloc and check for u32 overflow */
+@@ -570,7 +580,7 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 			goto free_map_locked;
+ 		if (percpu) {
+ 			err = bpf_mem_alloc_init(&htab->pcpu_ma,
+-						 round_up(htab->map.value_size, 8), true);
++						 round_up(htab->map.value_size, 16), true);
+ 			if (err)
+ 				goto free_map_locked;
+ 		}
+@@ -675,8 +685,26 @@ static void *htab_map_lookup_elem(struct bpf_map *map, void *key)
+ {
+ 	struct htab_elem *l = __htab_map_lookup_elem(map, key);
+ 
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++	void *value;
++	u32 value_size;
++	u64 *or_mask = sandbox_ctx + BPF_SANDBOX_MAP_OR_MASK_OFFSET;
++	u64 *and_mask = sandbox_ctx + BPF_SANDBOX_MAP_AND_MASK_OFFSET;
++
++	if (l) {
++		value = l->key + round_up(map->key_size, 16);
++		value_size = round_up(map->value_size, 16);
++		map->sandbox_or_mask = 0;
++		map->sandbox_and_mask = 0;
++		*or_mask = gen_or_mask(value, value_size);
++		*and_mask = gen_and_mask(value_size);
++		return value;
++	}
++#else
+ 	if (l)
+-		return l->key + round_up(map->key_size, 8);
++		return bpf_mte_set_tag(l->key + round_up(map->key_size, 16),
++							   BPF_MTE_TAG_SANDBOX);
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
+ 
+ 	return NULL;
+ }
+@@ -703,7 +731,7 @@ static int htab_map_gen_lookup(struct bpf_map *map, struct bpf_insn *insn_buf)
+ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 1);
+ 	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
+ 				offsetof(struct htab_elem, key) +
+-				round_up(map->key_size, 8));
++				round_up(map->key_size, 16));
+ 	return insn - insn_buf;
+ }
+ 
+@@ -715,7 +743,7 @@ static __always_inline void *__htab_lru_map_lookup_elem(struct bpf_map *map,
+ 	if (l) {
+ 		if (mark)
+ 			bpf_lru_node_set_ref(&l->lru_node);
+-		return l->key + round_up(map->key_size, 8);
++		return l->key + round_up(map->key_size, 16);
+ 	}
+ 
+ 	return NULL;
+@@ -752,14 +780,14 @@ static int htab_lru_map_gen_lookup(struct bpf_map *map,
+ 			     1);
+ 	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
+ 				offsetof(struct htab_elem, key) +
+-				round_up(map->key_size, 8));
++				round_up(map->key_size, 16));
+ 	return insn - insn_buf;
+ }
+ 
+ static void check_and_free_fields(struct bpf_htab *htab,
+ 				  struct htab_elem *elem)
+ {
+-	void *map_value = elem->key + round_up(htab->map.key_size, 8);
++	void *map_value = elem->key + round_up(htab->map.key_size, 16);
+ 
+ 	bpf_obj_free_fields(htab->map.record, map_value);
+ }
+@@ -920,7 +948,7 @@ static void pcpu_copy_value(struct bpf_htab *htab, void __percpu *pptr,
+ 		/* copy true value_size bytes */
+ 		memcpy(this_cpu_ptr(pptr), value, htab->map.value_size);
+ 	} else {
+-		u32 size = round_up(htab->map.value_size, 8);
++		u32 size = round_up(htab->map.value_size, 16);
+ 		int off = 0, cpu;
+ 
+ 		for_each_possible_cpu(cpu) {
+@@ -940,7 +968,7 @@ static void pcpu_init_value(struct bpf_htab *htab, void __percpu *pptr,
+ 	 * (onallcpus=false always when coming from bpf prog).
+ 	 */
+ 	if (!onallcpus) {
+-		u32 size = round_up(htab->map.value_size, 8);
++		u32 size = round_up(htab->map.value_size, 16);
+ 		int current_cpu = raw_smp_processor_id();
+ 		int cpu;
+ 
+@@ -1028,10 +1056,10 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
+ 			htab_elem_set_ptr(l_new, key_size, pptr);
+ 	} else if (fd_htab_map_needs_adjust(htab)) {
+ 		size = round_up(size, 8);
+-		memcpy(l_new->key + round_up(key_size, 8), value, size);
++		memcpy(l_new->key + round_up(key_size, 16), value, size);
+ 	} else {
+ 		copy_map_value(&htab->map,
+-			       l_new->key + round_up(key_size, 8),
++			       l_new->key + round_up(key_size, 16),
+ 			       value);
+ 	}
+ 
+@@ -1094,7 +1122,7 @@ static long htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 		if (l_old) {
+ 			/* grab the element lock and update value in place */
+ 			copy_map_value_locked(map,
+-					      l_old->key + round_up(key_size, 8),
++					      l_old->key + round_up(key_size, 16),
+ 					      value, false);
+ 			return 0;
+ 		}
+@@ -1122,7 +1150,7 @@ static long htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 		 * and update element in place
+ 		 */
+ 		copy_map_value_locked(map,
+-				      l_old->key + round_up(key_size, 8),
++				      l_old->key + round_up(key_size, 16),
+ 				      value, false);
+ 		ret = 0;
+ 		goto err;
+@@ -1136,6 +1164,12 @@ static long htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 		goto err;
+ 	}
+ 
++#ifdef CONFIG_BPF_SANDBOX_MTE
++	bpf_mte_tag_mem(bpf_mte_set_tag(l_new->key + round_up(map->key_size, 16),
++					BPF_MTE_TAG_SANDBOX), round_up(map->value_size, 16),
++					false);
++#endif /* CONFIG_BPF_SANDBOX_MTE */
++
+ 	/* add new element to the head of the list, so that
+ 	 * concurrent search will find it before old elem
+ 	 */
+@@ -1193,7 +1227,7 @@ static long htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value
+ 	if (!l_new)
+ 		return -ENOMEM;
+ 	copy_map_value(&htab->map,
+-		       l_new->key + round_up(map->key_size, 8), value);
++		       l_new->key + round_up(map->key_size, 16), value);
+ 
+ 	ret = htab_lock_bucket(htab, b, hash, &flags);
+ 	if (ret)
+@@ -1469,7 +1503,8 @@ static void htab_free_malloced_timers(struct bpf_htab *htab)
+ 
+ 		hlist_nulls_for_each_entry(l, n, head, hash_node) {
+ 			/* We only free timer on uref dropping to zero */
+-			bpf_obj_free_timer(htab->map.record, l->key + round_up(htab->map.key_size, 8));
++			bpf_obj_free_timer(htab->map.record,
++				l->key + round_up(htab->map.key_size, 16));
+ 		}
+ 		cond_resched_rcu();
+ 	}
+@@ -1571,7 +1606,7 @@ static int __htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
+ 		ret = -ENOENT;
+ 	} else {
+ 		if (is_percpu) {
+-			u32 roundup_value_size = round_up(map->value_size, 8);
++			u32 roundup_value_size = round_up(map->value_size, 16);
+ 			void __percpu *pptr;
+ 			int off = 0, cpu;
+ 
+@@ -1583,7 +1618,7 @@ static int __htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
+ 				off += roundup_value_size;
+ 			}
+ 		} else {
+-			u32 roundup_key_size = round_up(map->key_size, 8);
++			u32 roundup_key_size = round_up(map->key_size, 16);
+ 
+ 			if (flags & BPF_F_LOCK)
+ 				copy_map_value_locked(map, value, l->key +
+@@ -1687,9 +1722,9 @@ __htab_map_lookup_and_delete_batch(struct bpf_map *map,
+ 		return -ENOENT;
+ 
+ 	key_size = htab->map.key_size;
+-	roundup_key_size = round_up(htab->map.key_size, 8);
++	roundup_key_size = round_up(htab->map.key_size, 16);
+ 	value_size = htab->map.value_size;
+-	size = round_up(value_size, 8);
++	size = round_up(value_size, 16);
+ 	if (is_percpu)
+ 		value_size = size * num_possible_cpus();
+ 	total = 0;
+@@ -2040,12 +2075,12 @@ static int __bpf_hash_map_seq_show(struct seq_file *seq, struct htab_elem *elem)
+ 		ctx.meta = &meta;
+ 		ctx.map = info->map;
+ 		if (elem) {
+-			roundup_key_size = round_up(map->key_size, 8);
++			roundup_key_size = round_up(map->key_size, 16);
+ 			ctx.key = elem->key;
+ 			if (!info->percpu_value_buf) {
+ 				ctx.value = elem->key + roundup_key_size;
+ 			} else {
+-				roundup_value_size = round_up(map->value_size, 8);
++				roundup_value_size = round_up(map->value_size, 16);
+ 				pptr = htab_elem_get_ptr(elem, map->key_size);
+ 				for_each_possible_cpu(cpu) {
+ 					bpf_long_memcpy(info->percpu_value_buf + off,
+@@ -2085,7 +2120,7 @@ static int bpf_iter_init_hash_map(void *priv_data,
+ 
+ 	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
+ 	    map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
+-		buf_size = round_up(map->value_size, 8) * num_possible_cpus();
++		buf_size = round_up(map->value_size, 16) * num_possible_cpus();
+ 		value_buf = kmalloc(buf_size, GFP_USER | __GFP_NOWARN);
+ 		if (!value_buf)
+ 			return -ENOMEM;
+@@ -2141,7 +2176,7 @@ static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_
+ 
+ 	is_percpu = htab_is_percpu(htab);
+ 
+-	roundup_key_size = round_up(map->key_size, 8);
++	roundup_key_size = round_up(map->key_size, 16);
+ 	/* disable migration so percpu value prepared here will be the
+ 	 * same as the one seen by the bpf program with bpf_map_lookup_elem().
+ 	 */
+@@ -2284,7 +2319,7 @@ int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value)
+ 	 * access 'value_size' of them, so copying rounded areas
+ 	 * will not leak any kernel data
+ 	 */
+-	size = round_up(map->value_size, 8);
++	size = round_up(map->value_size, 16);
+ 	rcu_read_lock();
+ 	l = __htab_map_lookup_elem(map, key);
+ 	if (!l)
+@@ -2497,7 +2532,7 @@ static int htab_of_map_gen_lookup(struct bpf_map *map,
+ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 2);
+ 	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
+ 				offsetof(struct htab_elem, key) +
+-				round_up(map->key_size, 8));
++				round_up(map->key_size, 16));
+ 	*insn++ = BPF_LDX_MEM(BPF_DW, ret, ret, 0);
+ 
+ 	return insn - insn_buf;
+diff --git a/kernel/bpf/malloc.c b/kernel/bpf/malloc.c
+new file mode 100644
+index 000000000..a201b9459
+--- /dev/null
++++ b/kernel/bpf/malloc.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (c) 2023 University of British Columbia
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++#include <linux/filter.h>
++#include <linux/bpf_mte.h>
++#include <linux/bpf_malloc.h>
++#include <linux/bpf_sandbox.h>
++
++typedef u64 header_t;
++#define BPF_ALIGNMENT 8
++#define BPF_HEADER_SIZE sizeof(header_t)
++#define BPF_ALIGN(size) (((size) + (BPF_ALIGNMENT - 1)) & ~(BPF_ALIGNMENT - 1))
++
++static void bpf_sandbox_add_sync_pair(u64 copy, u64 to_sync)
++{
++	for (int i = 0; i < MAX_SYNC_PAIRS; i++) {
++		if (current_sandbox_info->sync_pairs[i].sandbox_ptr == 0) {
++			current_sandbox_info->sync_pairs[i].sandbox_ptr = copy;
++			current_sandbox_info->sync_pairs[i].kernel_ptr = to_sync;
++			return;
++		}
++	}
++	pr_info("BPF Sandbox: Insufficient space to store sync pairs.");
++}
++
++static void bpf_sandbox_remove_sync_pair(u64 copy)
++{
++	for (int i = 0; i < MAX_SYNC_PAIRS; i++) {
++		if (current_sandbox_info->sync_pairs[i].sandbox_ptr == copy) {
++			current_sandbox_info->sync_pairs[i].sandbox_ptr = 0;
++			current_sandbox_info->sync_pairs[i].kernel_ptr = 0;
++			return;
++		}
++	}
++	pr_info("BPF Sandbox: %llx not synced, unable to remove from sync pairs.", copy);
++}
++
++// Allocate and return the previous program break, which also points to the new
++// area if increment is successful
++static void *bpf_sbrk(size_t size)
++{
++	void *ret;
++
++	if (unlikely(current_sandbox_info->free_size < size)) {
++		pr_info("BPF Sandbox: free space on heap = %llu", current_sandbox_info->free_size);
++		pr_info("BPF Sandbox: memory requested = %lu", size);
++		panic("BPF Sandbox: fail to allocate memory dynamically.");
++		return NULL;         // return NULL won't be reached
++	}
++	current_sandbox_info->prog_brk += size;
++	current_sandbox_info->free_size -= size;
++	ret = (void *)current_sandbox_info->prog_brk - size;
++	return bpf_mte_set_tag(ret, BPF_MTE_TAG_SANDBOX);
++}
++
++void *bpf_sandbox_get_kernel_ptr(u64 sandbox_ptr)
++{
++	for (int i = 0; i < MAX_SYNC_PAIRS; i++)
++		if (current_sandbox_info->sync_pairs[i].sandbox_ptr == sandbox_ptr)
++			return (void *)current_sandbox_info->sync_pairs[i].kernel_ptr;
++	pr_info("BPF Sandbox: Fail to find a match for sandbox ptr %llx.", sandbox_ptr);
++	return NULL;
++}
++
++void *bpf_malloc(size_t size, void *to_sync)
++{
++	u64 untagged_kptr = bpf_mte_set_tag((u64)to_sync, BPF_MTE_TAG_KERNEL);
++	size_t blk_size = BPF_ALIGN(size + BPF_HEADER_SIZE);
++	header_t *header = bpf_sbrk(blk_size);
++
++	*header = blk_size | 1; // set allocated bit
++	if (likely(to_sync))
++		bpf_sandbox_add_sync_pair((u64)header + BPF_HEADER_SIZE, untagged_kptr);
++	return (void *)header + BPF_HEADER_SIZE;
++}
++EXPORT_SYMBOL(bpf_malloc);
++
++void bpf_free(void *sandbox_ptr)
++{
++	header_t *header;
++
++	bpf_sandbox_remove_sync_pair((u64)sandbox_ptr);
++	header = (void *)sandbox_ptr - BPF_HEADER_SIZE;
++	// unset allocated bit, though right now we're not using for reallocation
++	*header = *header & ~1L;
++}
+diff --git a/kernel/bpf/map.c b/kernel/bpf/map.c
+new file mode 100644
+index 000000000..d507f5aec
+--- /dev/null
++++ b/kernel/bpf/map.c
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2023 University of British Columbia
++ *
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++
++#include <linux/hashtable.h>
++#include <linux/bpf_map.h>
++
++#ifdef CONFIG_BPF_SFI_MAP_MASKING
++
++/**
++ * struct bpf_map_env - sandbox environment for bpf maps
++ *
++ * Each bpf_map_env structre delcares a hashtable named active_map_ht
++ * with 16 buckets, and lookup_func_ht with 16 buckets.
++ */
++struct bpf_map_env {
++	DECLARE_HASHTABLE(active_map_ht, 4);          // 16 buckets
++	DECLARE_HASHTABLE(lookup_func_ht, 4);          // 16 buckets
++};
++
++/**
++ * struct bpf_map_entry - defines an entry in the active map hash table
++ *
++ * @addr: address of struct bpf_map
++ * @hnode: hashable node to link helper function to the function hashtable
++ *
++ * Every active bpf map has an address of its struct bpf_map and
++ * a hashable node that allows the map entry to be added to
++ * the hashtable of currently active maps.
++ */
++struct bpf_map_entry {
++	u64			addr;
++	struct hlist_node	hnode;
++};
++
++/**
++ * struct bpf_lookup_func_entry - defines an entry in the lookup function
++ *								  hash table
++ *
++ * @addr: address of lookup function
++ * @hnode: hashable node to link helper function to the function hashtable
++ *
++ * Every active bpf map has an address of its lookup function and
++ * a hashable node that allows the map entry to be added to
++ * the hashtable of map lookup functions. Note that we only record lookups
++ * because that is the only map operation that returns a pointer to the
++ * map value (which we need to mask).
++ */
++struct bpf_lookup_func_entry {
++	u64			addr;
++	struct hlist_node	hnode;
++};
++
++static struct bpf_map_env *bpf_map_env;
++
++/**
++ * bpf_sandbox_add_map() - add a map to hash table
++ *
++ * @map: pointer to struct bpf_map
++ *
++ * Stores the address of the maps, to be invoked during map creation.
++ * During JIT compilation, we search the hash table to determine if
++ * an imm64 is a map.
++ */
++void bpf_sandbox_add_map(struct bpf_map *map)
++{
++	struct bpf_map_entry *e;
++
++	e = kzalloc(sizeof(struct bpf_map_entry), GFP_ATOMIC);
++	if (!e)
++		return;
++
++	e->addr = (u64)map;
++	hash_add(bpf_map_env->active_map_ht, &e->hnode, (u64)map);
++
++	// pr_info("BPF: Added map %llx to ht", (u64)map);
++}
++EXPORT_SYMBOL(bpf_sandbox_add_map);
++
++/**
++ * bpf_sandbox_delete_map() - delete a map from hash table
++ *
++ * @map: pointer to struct bpf_map
++ *
++ * Deletes the map entry, to be invoked during map free.
++ */
++void bpf_sandbox_delete_map(struct bpf_map *map)
++{
++	int i;
++	struct hlist_node *tmp;
++	struct bpf_map_entry *e;
++
++	hash_for_each_safe(bpf_map_env->active_map_ht, i, tmp, e, hnode) {
++		if (e->addr == (u64)map) {
++			hash_del(&e->hnode);
++			kfree(e);
++			// pr_info("BPF: Deleted map %llx from ht", (u64)map);
++			return;
++		}
++	}
++}
++EXPORT_SYMBOL(bpf_sandbox_delete_map);
++
++/**
++ * bpf_sandbox_add_map_lookup() - add a map lookup func to hash table
++ *
++ * @ops: a struct containing all the operations for a map type
++ *
++ * Stores the address of the lookup function, to be invoked when
++ * the verifier is doing post-verification fixups. During JIT
++ * compilation, once a map lookup function is called, the return
++ * register will need special map masking.
++ */
++void bpf_sandbox_add_map_lookup(const struct bpf_map_ops *ops)
++{
++	struct bpf_lookup_func_entry *e;
++	u64 lookup_fn = (u64)ops->map_lookup_elem;
++
++	if (lookup_fn && !is_map_lookup(lookup_fn)) {
++		e = kzalloc(sizeof(struct bpf_lookup_func_entry), GFP_ATOMIC);
++		if (!e)
++			return;
++
++		e->addr = lookup_fn;
++		hash_add(bpf_map_env->lookup_func_ht, &e->hnode, lookup_fn);
++		// pr_info("BPF: Added lookup func %llx to ht, is_map_lookup = %d",
++					// lookup_fn, is_map_lookup(lookup_fn));
++	}
++
++}
++EXPORT_SYMBOL(bpf_sandbox_add_map_lookup);
++
++/**
++ * is_active_map() - checks if a map is currently active
++ *
++ * @addr: address of struct bpf_map
++ *
++ * To be called by the JIT compiler to check if an imm64 is
++ * an active map.
++ */
++bool is_active_map(u64 map)
++{
++	struct bpf_map_entry *e;
++
++	hash_for_each_possible(bpf_map_env->active_map_ht, e, hnode, map) {
++		if (e->addr == map)
++			return true;
++	}
++
++	return false;
++}
++EXPORT_SYMBOL(is_active_map);
++
++/**
++ * is_map_lookup() - checks if a given function is a
++ *					 map lookup function.
++ *
++ * @fn: 64-bit address of a function
++ *
++ * To be called by the JIT compiler to check if the eBPF
++ * program is calling a map lookup function.
++ */
++bool is_map_lookup(u64 fn)
++{
++	struct bpf_lookup_func_entry *e;
++
++	hash_for_each_possible(bpf_map_env->lookup_func_ht, e, hnode, fn) {
++		if (e->addr == fn)
++			return true;
++	}
++
++	return false;
++}
++EXPORT_SYMBOL(is_map_lookup);
++
++/**
++ * init_bpf_map_env() - initializes the hash tables for eBPF maps
++ */
++static int __init init_bpf_map_env(void)
++{
++	bpf_map_env = kmalloc(sizeof(struct bpf_map_env), GFP_ATOMIC);
++	if (bpf_map_env) {
++		hash_init(bpf_map_env->lookup_func_ht);
++		hash_init(bpf_map_env->active_map_ht);
++	}
++	pr_info("BPF Sandbox: htabs for map initialized at %llx", (u64)bpf_map_env);
++	return 0;
++}
++
++core_initcall(init_bpf_map_env);
++
++#endif /* CONFIG_BPF_SFI_MAP_MASKING */
+diff --git a/kernel/bpf/mte.c b/kernel/bpf/mte.c
+new file mode 100644
+index 000000000..37280d6fa
+--- /dev/null
++++ b/kernel/bpf/mte.c
+@@ -0,0 +1,339 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2023 University of British Columbia
++ *
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++
++#include <linux/bpf_mte.h>
++#include <linux/bpf_ctx.h>
++
++#ifdef CONFIG_BPF_SANDBOX_MTE
++
++#ifdef CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG
++int tag_clobber_memory[4];
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG */
++
++void bpf_tag_bpf_sock_skc(const struct bpf_prog *prog, struct sk_buff *ctx,
++								u8 tag, bool init)
++{
++	void *tagged_addr;
++	struct sock_common *skc = &ctx->sk->__sk_common;
++
++	if (skc && virt_addr_valid(skc)) {
++		tagged_addr = bpf_mte_set_tag(&skc->skc_family, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&skc->skc_rcv_saddr, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&skc->skc_daddr, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&skc->skc_num, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&skc->skc_dport, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag((void *)&skc->skc_state, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(skc->skc_v6_daddr.s6_addr32, tag);
++		bpf_mte_tag_mem(tagged_addr, 4*sizeof(__u32), init);
++
++		tagged_addr = bpf_mte_set_tag(skc->skc_v6_rcv_saddr.s6_addr32, tag);
++		bpf_mte_tag_mem(tagged_addr, 4*sizeof(__u32), init);
++	}
++}
++
++void bpf_tag__sk_buff_bpf_sock(const struct bpf_prog *prog, struct sk_buff *ctx,
++								u8 tag, bool init)
++{
++	void *tagged_addr;
++
++	if (ctx->sk && virt_addr_valid(ctx->sk)) {
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_bound_dev_if, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_type, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_protocol, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_mark, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_priority, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_rx_queue_mapping, tag);
++		bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++
++		tagged_addr = bpf_mte_set_tag(&ctx->sk->sk_type, tag);
++		bpf_mte_tag_mem(&ctx->sk->sk_type, MTE_GRANULE_SIZE, init);
++
++		bpf_tag_bpf_sock_skc(prog, ctx, tag, init);
++		ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++	}
++}
++
++void bpf_tag_sk_filter_ctx(const struct bpf_prog *prog, struct sk_buff *ctx, u8 tag, bool init)
++{
++	int offset, bit;
++	void *tagged_addr;
++	struct sock_common *skc;
++	struct qdisc_skb_cb *qdisc_cb;
++	struct skb_shared_info *skb_shared;
++	struct bpf_skb_data_end_mirror *bpf_skb_data;
++
++	skc = &ctx->sk->__sk_common;
++	qdisc_cb = qdisc_skb_cb(ctx);
++	skb_shared = skb_shinfo(ctx);
++	bpf_skb_data = (struct bpf_skb_data_end_mirror *)ctx->cb;
++
++	for (bit = 0; bit < SOCKET_FILTER_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_read_write_bitmap, SOCKET_FILTER_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++
++		switch (offset)	{
++		case offsetof(struct __sk_buff, len):
++			tagged_addr = bpf_mte_set_tag(&ctx->len, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, protocol):
++			tagged_addr = bpf_mte_set_tag(&ctx->protocol, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, vlan_proto):
++			tagged_addr = bpf_mte_set_tag(&ctx->vlan_proto, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, priority):
++			tagged_addr = bpf_mte_set_tag(&ctx->priority, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, ingress_ifindex):
++			tagged_addr = bpf_mte_set_tag(&ctx->skb_iif, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, hash):
++			tagged_addr = bpf_mte_set_tag(&ctx->hash, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, mark):
++			tagged_addr = bpf_mte_set_tag(&ctx->mark, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, pkt_type):
++			tagged_addr = bpf_mte_set_tag(&ctx->__pkt_type_offset[0], tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, queue_mapping):
++			tagged_addr = bpf_mte_set_tag(&ctx->queue_mapping, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, vlan_present):
++			tagged_addr = bpf_mte_set_tag(&ctx->vlan_all, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, vlan_tci):
++			tagged_addr = bpf_mte_set_tag(&ctx->vlan_tci, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		// This is a void *, tag according to what it is casted to
++		case offsetof(struct __sk_buff, data):
++			tagged_addr = bpf_mte_set_tag(&ctx->data, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, tc_index):
++			tagged_addr = bpf_mte_set_tag(&ctx->tc_index, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, napi_id):
++			tagged_addr = bpf_mte_set_tag(&ctx->napi_id, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		/* net_device */
++		case offsetof(struct __sk_buff, ifindex):
++			tagged_addr = bpf_mte_set_tag(&ctx->dev->ifindex, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			tagged_addr = bpf_mte_set_tag(&ctx->dev, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			ctx->dev = bpf_mte_set_tag(ctx->dev, tag);
++			// pr_info("BPF MTE: netdev = %llx", (u64)ctx->dev);
++			break;
++		/* qdisc_skb_cb */
++		case offsetof(struct __sk_buff, cb[0]) ...
++			 offsetofend(struct __sk_buff, cb[4]) - 1:
++			tagged_addr = bpf_mte_set_tag(qdisc_cb->data, tag);
++			bpf_mte_tag_mem(tagged_addr, 5*sizeof(__u32), init);
++			tagged_addr = bpf_mte_set_tag(&qdisc_cb, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, tc_classid):
++			tagged_addr = bpf_mte_set_tag(&qdisc_cb->tc_classid, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			tagged_addr = bpf_mte_set_tag(&qdisc_cb, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, wire_len):
++			tagged_addr = bpf_mte_set_tag(&qdisc_cb->pkt_len, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			tagged_addr = bpf_mte_set_tag(&qdisc_cb, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		/* bpf_skb_data_end */
++		case offsetof(struct __sk_buff, data_meta):
++			// TODO
++			break;
++		case offsetof(struct __sk_buff, data_end):
++			// TODO
++			break;
++		/* sock_common */
++		case offsetof(struct __sk_buff, family):
++			tagged_addr = bpf_mte_set_tag(&skc->skc_family, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		case offsetof(struct __sk_buff, remote_ip4):
++			tagged_addr = bpf_mte_set_tag(&skc->skc_daddr, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		case offsetof(struct __sk_buff, local_ip4):
++			tagged_addr = bpf_mte_set_tag(&skc->skc_rcv_saddr, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		case offsetof(struct __sk_buff, remote_ip6[0]) ...
++			 offsetof(struct __sk_buff, remote_ip6[3]):
++			tagged_addr = bpf_mte_set_tag(skc->skc_v6_daddr.s6_addr32, tag);
++			bpf_mte_tag_mem(tagged_addr, 4*sizeof(__u32), init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		case offsetof(struct __sk_buff, local_ip6[0]) ...
++			 offsetof(struct __sk_buff, local_ip6[3]):
++			tagged_addr = bpf_mte_set_tag(skc->skc_v6_rcv_saddr.s6_addr32, tag);
++			bpf_mte_tag_mem(tagged_addr, 4*sizeof(__u32), init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		case offsetof(struct __sk_buff, remote_port):
++			tagged_addr = bpf_mte_set_tag(&skc->skc_dport, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		case offsetof(struct __sk_buff, local_port):
++			tagged_addr = bpf_mte_set_tag(&skc->skc_num, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			ctx->sk = bpf_mte_set_tag(ctx->sk, tag);
++			break;
++		/* skb_shared_info */
++		case offsetof(struct __sk_buff, gso_segs):
++			tagged_addr = bpf_mte_set_tag(&skb_shared->gso_segs, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, gso_size):
++			tagged_addr = bpf_mte_set_tag(&skb_shared->gso_size, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, hwtstamp):
++			tagged_addr = bpf_mte_set_tag(&skb_shared->hwtstamps.hwtstamp, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, tstamp):
++			tagged_addr = bpf_mte_set_tag(ctx->__pkt_vlan_present_offset, tag);
++			bpf_mte_tag_mem(ctx->__pkt_vlan_present_offset, MTE_GRANULE_SIZE, init);
++			tagged_addr = bpf_mte_set_tag(&ctx->tstamp, tag);
++			bpf_mte_tag_mem(tagged_addr, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, tstamp_type):
++			tagged_addr = bpf_mte_set_tag(ctx->__pkt_vlan_present_offset, tag);
++			bpf_mte_tag_mem(ctx->__pkt_vlan_present_offset, MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct __sk_buff, sk):
++			bpf_tag__sk_buff_bpf_sock(prog, ctx, tag, init);
++			break;
++		}
++	}
++}
++
++void bpf_tag_xdp_ctx(const struct bpf_prog *prog, struct xdp_buff *ctx, u8 tag, bool init)
++{
++	int offset, bit;
++	struct xdp_rxq_info *rxq = ctx->rxq;
++	struct xdp_txq_info *txq = ctx->txq;
++	int data_size_bit = (u64)ctx->data_end - (u64)ctx->data;
++	int metadata_size_bit = (u64)ctx->data - (u64)ctx->data_meta;
++
++	for (bit = 0; bit < XDP_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_read_write_bitmap, XDP_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++		// pr_info("CTX XDP: bit = %d, offset = %d", bit, offset);
++
++		switch (offset)	{
++		case offsetof(struct xdp_md, data):
++			bpf_mte_tag_mem(bpf_mte_set_tag(&ctx->data, tag),
++						MTE_GRANULE_SIZE, init);
++			bpf_mte_tag_mem(bpf_mte_set_tag(ctx->data, tag),
++						data_size_bit, init);
++			break;
++		case offsetof(struct xdp_md, data_meta):
++			bpf_mte_tag_mem(bpf_mte_set_tag(&ctx->data_meta, tag),
++						MTE_GRANULE_SIZE, init);
++			if (metadata_size_bit > 0)
++				bpf_mte_tag_mem(bpf_mte_set_tag(ctx->data_meta, tag),
++						metadata_size_bit, init);
++			break;
++		case offsetof(struct xdp_md, data_end):
++			bpf_mte_tag_mem(bpf_mte_set_tag(&ctx->data_end, tag),
++						MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct xdp_md, ingress_ifindex):
++			bpf_mte_tag_mem(bpf_mte_set_tag(&ctx->rxq, tag),
++						MTE_GRANULE_SIZE, init);
++			bpf_mte_tag_mem(bpf_mte_set_tag(rxq->dev, tag),
++						MTE_GRANULE_SIZE, init);
++			bpf_mte_tag_mem(bpf_mte_set_tag(&rxq->dev->ifindex, tag),
++						MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct xdp_md, rx_queue_index):
++			bpf_mte_tag_mem(bpf_mte_set_tag(&ctx->rxq, tag),
++						MTE_GRANULE_SIZE, init);
++			bpf_mte_tag_mem(bpf_mte_set_tag(&rxq->queue_index, tag),
++						MTE_GRANULE_SIZE, init);
++			break;
++		case offsetof(struct xdp_md, egress_ifindex):
++			bpf_mte_tag_mem(bpf_mte_set_tag(&ctx->txq, tag),
++						MTE_GRANULE_SIZE, init);
++			bpf_mte_tag_mem(bpf_mte_set_tag(txq->dev, tag),
++						MTE_GRANULE_SIZE, init);
++			bpf_mte_tag_mem(bpf_mte_set_tag(&txq->dev->ifindex, tag),
++						MTE_GRANULE_SIZE, init);
++			break;
++		}
++	}
++}
++
++void bpf_mte_tag_ctx(const struct bpf_prog *prog, const void *ctx,
++					size_t size, u8 tag, bool init)
++{
++	switch (prog->type) {
++	case BPF_PROG_TYPE_SOCKET_FILTER:
++		bpf_tag_sk_filter_ctx(prog, (struct sk_buff *)ctx, tag, init);
++		break;
++	case BPF_PROG_TYPE_XDP:
++		bpf_tag_xdp_ctx(prog, (struct xdp_buff *)ctx, tag, init);
++		break;
++	case BPF_PROG_TYPE_KPROBE:
++		bpf_mte_tag_mem(bpf_mte_set_tag(ctx, tag),
++						sizeof(bpf_user_pt_regs_t), init);
++		break;
++	default:
++		break;
++	}
++}
++EXPORT_SYMBOL(bpf_mte_tag_ctx);
++
++#endif /* CONFIG_BPF_SANDBOX_MTE */
+diff --git a/kernel/bpf/mte_slow.c b/kernel/bpf/mte_slow.c
+new file mode 100644
+index 000000000..7eda06f11
+--- /dev/null
++++ b/kernel/bpf/mte_slow.c
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2023 University of British Columbia
++ *
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++
++#include <linux/bpf_mte.h>
++#include <linux/bpf_ctx.h>
++
++#ifdef CONFIG_BPF_SANDBOX_MTE
++
++#ifdef CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG
++int tag_clobber_memory[4];
++#endif /* CONFIG_BPF_SANDBOX_MTE_ANALOG_TAG */
++
++void bpf_tag_sk_filter_ctx(const struct bpf_prog *prog, struct sk_buff *ctx, u8 tag, bool init)
++{
++	int offset, bit;
++	void *tagged_addr;
++
++	for (bit = 0; bit < SOCKET_FILTER_BITMAP_SIZE; bit++) {
++		bit = find_next_bit(prog->ctx_read_write_bitmap, SOCKET_FILTER_BITMAP_SIZE, bit);
++		offset = bit * BITMAP_COMPRESSION;
++
++		switch (offset)	{
++		case offsetof(struct __sk_buff, ifindex):
++			tagged_addr = bpf_mte_set_tag(ctx->dev, tag);
++			bpf_mte_tag_mem(tagged_addr, sizeof(struct net_device), init);
++			ctx->dev = tagged_addr;
++			// pr_info("BPF MTE: netdev = %llx", (u64)ctx->dev);
++			break;
++		case offsetof(struct __sk_buff, family):
++		case offsetof(struct __sk_buff, remote_ip4):
++		case offsetof(struct __sk_buff, local_ip4):
++		case offsetof(struct __sk_buff, remote_port):
++		case offsetof(struct __sk_buff, local_port):
++		case offsetof(struct __sk_buff, remote_ip6[0]) ...
++			 offsetof(struct __sk_buff, remote_ip6[3]):
++		case offsetof(struct __sk_buff, local_ip6[0]) ...
++			 offsetof(struct __sk_buff, local_ip6[3]):
++			if (bpf_mte_get_tag(ctx->sk) != tag) {
++				tagged_addr = bpf_mte_set_tag(ctx->sk, tag);
++				bpf_mte_tag_mem(tagged_addr, sizeof(struct sock_common), init);
++				ctx->sk = tagged_addr;
++				// pr_info("BPF MTE: sk = %llx", (u64)ctx->sk);
++			}
++			break;
++		}
++	}
++}
++
++void bpf_mte_tag_ctx(const struct bpf_prog *prog, const void *ctx,
++					size_t size, u8 tag, bool init)
++{
++	bpf_mte_tag_mem(bpf_mte_set_tag(ctx, tag), size, init);
++
++	switch (prog->type) {
++	case BPF_PROG_TYPE_SOCKET_FILTER:
++		bpf_tag_sk_filter_ctx(prog, (struct sk_buff *)ctx, tag, init);
++		break;
++	default:
++		break;
++	}
++}
++EXPORT_SYMBOL(bpf_mte_tag_ctx);
++
++#endif /* CONFIG_BPF_SANDBOX_MTE */
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index f9bbc254c..073e9eb6a 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -1,4 +1,6 @@
+ #include <linux/bpf.h>
++#include <linux/bpf_malloc.h>
++#include <linux/bpf_sandbox.h>
+ #include <linux/btf.h>
+ #include <linux/err.h>
+ #include <linux/irq_work.h>
+@@ -11,6 +13,7 @@
+ #include <linux/kmemleak.h>
+ #include <uapi/linux/btf.h>
+ #include <linux/btf_ids.h>
++#include <linux/bpf_mte.h>
+ 
+ #define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE)
+ 
+@@ -143,6 +146,10 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
+ 		kmemleak_not_leak(pages);
+ 		rb->pages = pages;
+ 		rb->nr_pages = nr_pages;
++#ifdef CONFIG_BPF_SANDBOX_MTE
++		bpf_mte_tag_mem(bpf_mte_set_tag(rb->data, BPF_MTE_TAG_SANDBOX),
++						nr_data_pages * PAGE_SIZE, false);
++#endif /* CONFIG_BPF_SANDBOX_MTE */
+ 		return rb;
+ 	}
+ 
+@@ -393,6 +400,11 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
+ 	unsigned long cons_pos, prod_pos, new_prod_pos, flags;
+ 	u32 len, pg_off;
+ 	struct bpf_ringbuf_hdr *hdr;
++	#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++		void *sandbox_reserve;
++		bool caller_sandboxed = is_caller_sandboxed();
++	#endif
++
+ 
+ 	if (unlikely(size > RINGBUF_MAX_RECORD_SZ))
+ 		return NULL;
+@@ -426,12 +438,25 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
+ 	hdr->len = size | BPF_RINGBUF_BUSY_BIT;
+ 	hdr->pg_off = pg_off;
+ 
++#ifdef CONFIG_BPF_SANDBOX_MTE
++	hdr = bpf_mte_set_tag(hdr, BPF_MTE_TAG_SANDBOX);
++#endif /* CONFIG_BPF_SANDBOX_MTE */
++
+ 	/* pairs with consumer's smp_load_acquire() */
+ 	smp_store_release(&rb->producer_pos, new_prod_pos);
+ 
+ 	spin_unlock_irqrestore(&rb->spinlock, flags);
+ 
+-	return (void *)hdr + BPF_RINGBUF_HDR_SZ;
++	#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++		if (caller_sandboxed) {
++			sandbox_reserve = bpf_malloc(size, (void *)hdr + BPF_RINGBUF_HDR_SZ);
++			return sandbox_reserve;
++		} else {
++			return (void *)hdr + BPF_RINGBUF_HDR_SZ;
++		}
++	#else
++		return (void *)hdr + BPF_RINGBUF_HDR_SZ;
++	#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
+ }
+ 
+ BPF_CALL_3(bpf_ringbuf_reserve, struct bpf_map *, map, u64, size, u64, flags)
+@@ -460,7 +485,27 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
+ 	struct bpf_ringbuf *rb;
+ 	u32 new_len;
+ 
++#ifdef CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT
++	void *data;
++
++	if (is_caller_sandboxed()) {
++		data = bpf_sandbox_get_kernel_ptr((u64)sample);
++		hdr = (void *)data - BPF_RINGBUF_HDR_SZ;
++		if (!hdr)
++			panic("hdr NULL in ringbuf commit");
++		memcpy(data, sample, hdr->len ^ BPF_RINGBUF_BUSY_BIT);
++		bpf_free(sample);
++	} else {
++		hdr = sample - BPF_RINGBUF_HDR_SZ;
++	}
++#else
+ 	hdr = sample - BPF_RINGBUF_HDR_SZ;
++#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT */
++
++#ifdef CONFIG_BPF_SANDBOX_MTE
++	hdr = bpf_mte_set_tag(hdr, BPF_MTE_TAG_KERNEL);
++#endif /* CONFIG_BPF_SANDBOX_MTE */
++
+ 	rb = bpf_ringbuf_restore_from_rec(hdr);
+ 	new_len = hdr->len ^ BPF_RINGBUF_BUSY_BIT;
+ 	if (discard)
+diff --git a/kernel/bpf/sandbox.c b/kernel/bpf/sandbox.c
+new file mode 100644
+index 000000000..7f4f37c1c
+--- /dev/null
++++ b/kernel/bpf/sandbox.c
+@@ -0,0 +1,453 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2023 University of British Columbia
++ *
++ * Author: Soo Yee Lim <sooyee@cs.ubc.ca>
++ */
++#include <linux/cpu.h>
++#include <linux/bpf.h>
++#include <linux/bpf_verifier.h>
++#include <linux/bpf_sandbox.h>
++#include <linux/skmsg.h>
++#include <linux/perf_event.h>
++#include "disasm.h"
++
++/**
++ * struct bpf_sandbox_env - sandbox environment for bpf program types
++ *
++ * Each bpf_sandbox_env structre delcares a hashtable named func_ht
++ * with 128 buckets, and a skb_func_ht with 16 buckets, and a
++ * xdp_func_ht with 16 buckets.
++ */
++struct bpf_sandbox_env {
++	DECLARE_HASHTABLE(func_ht, 7);          // 128 buckets
++	DECLARE_HASHTABLE(skb_func_ht, 4);      // 16 buckets
++	DECLARE_HASHTABLE(xdp_func_ht, 2);      // 2 buckets
++};
++
++/**
++ * struct bpf_helper - defines a bpf helper function
++ *
++ * @addr: address of the helper function
++ * @hnode: hashable node to link helper function to the function hashtable
++ *
++ * Every allowed bpf helper function has an address of where it is stored in
++ * memory and a hashable node that allows the helper function to be added to
++ * the hashtable of allowed functions for a given bpf program type.
++ */
++struct bpf_helper {
++	u64			addr;
++	struct hlist_node	hnode;
++};
++
++static struct bpf_sandbox_env *bpf_sandbox_env;
++
++/**
++ * struct bpf_verifier_ops - stores the verifier operations associated with each bpf program type
++ */
++static const struct bpf_verifier_ops *const bpf_verifier_ops[] = {
++#define BPF_PROG_TYPE(_id,		 _name, prog_ctx_type, kern_ctx_type) \
++	[_id] = &_name ## _verifier_ops,
++#define BPF_MAP_TYPE(_id,		 _ops)
++#define BPF_LINK_TYPE(_id,		 _name)
++#include <linux/bpf_types.h>
++#undef BPF_PROG_TYPE
++#undef BPF_MAP_TYPE
++#undef BPF_LINK_TYPE
++};
++
++/**
++ * bpf_ctx_size_map - stores the context size associated with each bpf program type
++ */
++size_t bpf_ctx_size_map[] = {
++#define BPF_PROG_TYPE(_id,	       _name, prog_ctx_type, kern_ctx_type) \
++	[_id] = sizeof(kern_ctx_type),
++#define BPF_MAP_TYPE(_id,	       _ops)
++#define BPF_LINK_TYPE(_id,	       _name)
++#include <linux/bpf_types.h>
++#undef BPF_PROG_TYPE
++#undef BPF_MAP_TYPE
++#undef BPF_LINK_TYPE
++	0,                             /* avoid empty array */
++};
++EXPORT_SYMBOL(bpf_ctx_size_map);
++
++/**
++ * is_allowed_helper() - checks if a helper function is allowed
++ *
++ * @prog_id: program type identifier
++ * @fn: helper function
++ *
++ * Iterates over all functions in the function hash table for the bpf sandbox
++ * environment specific to the passed program id and checks if the value of
++ * the passed helper function is equal to any functions defined in the
++ * hashtable. If it is equal then this function is an allowed helper function in
++ * the bpf sandbox environment for the specified program id.
++ *
++ * Return: Returns true if fn is an allowed helper function in the specified bpf
++ *         sandbox environment. Otherwise, returns false.
++ */
++static __always_inline bool is_allowed_helper(u64 prog_id, u64 fn)
++{
++	struct bpf_helper *a;
++
++	hash_for_each_possible(bpf_sandbox_env[prog_id].func_ht, a, hnode, fn) {
++		if (a->addr == fn)
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * is_skb_helper() - checks if a helper function takes sk_buff as its argument
++ *
++ * @prog_id: program type identifier
++ * @fn: helper function
++ *
++ * Iterates over all functions in the skb function hash table for the bpf sandbox
++ * environment specific to the passed program id and checks if the value of
++ * the passed helper function is equal to any functions defined in the
++ * hashtable. If it is equal then this function is an allowed helper function in
++ * the bpf sandbox environment for the specified program id.
++ *
++ * Return: Returns true if fn is an allowed helper function in the specified bpf
++ *         sandbox environment. Otherwise, returns false.
++ */
++static __always_inline bool is_skb_helper(u64 prog_id, u64 fn)
++{
++	struct bpf_helper *a;
++
++	hash_for_each_possible(bpf_sandbox_env[prog_id].skb_func_ht, a, hnode, fn) {
++		if (a->addr == fn)
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * is_xdp_helper() - checks if a helper function takes xdp_buff as its argument
++ *
++ * @prog_id: program type identifier
++ * @fn: helper function
++ *
++ * Iterates over all functions in the xdp function hash table for the bpf sandbox
++ * environment specific to the passed program id and checks if the value of
++ * the passed helper function is equal to any functions defined in the
++ * hashtable. If it is equal then this function is an allowed helper function in
++ * the bpf sandbox environment for the specified program id.
++ *
++ * Return: Returns true if fn is an allowed helper function in the specified bpf
++ *         sandbox environment. Otherwise, returns false.
++ */
++static __always_inline bool is_xdp_helper(u64 prog_id, u64 fn)
++{
++	struct bpf_helper *a;
++
++	hash_for_each_possible(bpf_sandbox_env[prog_id].xdp_func_ht, a, hnode, fn) {
++		if (a->addr == fn)
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * sandbox_tramp() - checks validity of helper function before calling
++ *
++ * Receives the call target which is the address of the helper function then
++ * determines if the call target is an allowed helper function of the specified
++ * bpf sandbox environment. If the helper function is determined to be valid,
++ * the helper function is called.
++ */
++#ifdef CONFIG_X86_64
++u64 sandbox_tramp(void)
++{
++	u64 prog_id;
++	volatile u64 call_target = bpf_sandbox_get_trampoline_target(&prog_id);
++
++#ifdef CONFIG_BPF_SANDBOX_CTX
++	if (unlikely(is_skb_helper(prog_id, call_target)) ||
++		unlikely(is_xdp_helper(prog_id, call_target)))
++		convert_bpf_ctx_to_kernel_ctx();
++#endif /* CONFIG_BPF_SANDBOX_CTX */
++
++#ifdef CONFIG_BPF_SFI_TRAMPOLINE
++	// Don't proceed if it's not a valid helper function
++	if (unlikely(!is_allowed_helper(prog_id, call_target)))
++		return 0;
++#endif /* CONFIG_BPF_SFI_TRAMPOLINE */
++
++	// Call the valid helper function
++	return bpf_sandbox_call_trampoline_target(call_target);
++
++	// TODO: if the helper function writes to fields accesible by __sk_buff,
++	//		 synchronize the changes back to __sk_buff
++}
++#endif
++
++#ifdef CONFIG_ARM64
++void sandbox_tramp(volatile u64 r1, volatile u64 r2, volatile u64 r3, volatile u64 r4,
++		   volatile u64 r5)
++{
++	u64 prog_id;
++	volatile u64 call_target = bpf_sandbox_get_trampoline_target(&prog_id);
++
++#ifdef CONFIG_BPF_SANDBOX_CTX
++	if (unlikely(is_skb_helper(prog_id, call_target)) ||
++		unlikely(is_xdp_helper(prog_id, call_target)))
++		convert_bpf_ctx_to_kernel_ctx(&r1);
++#endif /* CONFIG_BPF_SANDBOX_CTX */
++
++#ifdef CONFIG_BPF_SFI_TRAMPOLINE
++	// Don't proceed if it's not a valid helper function
++	if (unlikely(!is_allowed_helper(prog_id, call_target)))
++		return;
++#endif /* CONFIG_BPF_SFI_TRAMPOLINE */
++
++	// Call the valid helper function
++	bpf_sandbox_call_trampoline_target(call_target, r1, r2, r3, r4, r5);
++}
++EXPORT_SYMBOL(sandbox_tramp);
++#endif
++
++/**
++ * func_ht_add - adds a function to the hashtable of allowed helper functions
++ *
++ * @prog_id: program type identifier
++ * @fn: helper function
++ *
++ * Adds the new function, fn, to the hashtable of allowed helper functions
++ * for the bpf sandbox environment for the specified program type.
++ */
++static void func_ht_add(u64 prog_id, u64 fn)
++{
++	struct bpf_helper *a;
++
++	if (fn == 0)
++		return;
++
++	a = kzalloc(sizeof(struct bpf_helper), GFP_ATOMIC);
++	if (!a)
++		return;
++
++	a->addr = fn;
++	hash_add(bpf_sandbox_env[prog_id].func_ht, &a->hnode, fn);
++}
++
++/**
++ * skb_func_ht_add - adds a function that takes sk_buff as its argument
++ *					 to the hashtable
++ *
++ * @i: function id
++ * @prog_id: program type identifier
++ * @fn: helper function
++ *
++ * Adds the new function, fn, to the hashtable of skb helper functions
++ * for the bpf sandbox environment for the specified program type.
++ */
++static void skb_func_ht_add(int i, u64 prog_id, u64 fn)
++{
++	struct bpf_helper *a;
++
++	switch (i) {
++	case BPF_FUNC_skb_store_bytes:
++	case BPF_FUNC_skb_load_bytes:
++	case BPF_FUNC_l3_csum_replace:
++	case BPF_FUNC_l4_csum_replace:
++	case BPF_FUNC_clone_redirect:
++	case BPF_FUNC_get_cgroup_classid:
++	case BPF_FUNC_skb_vlan_push:
++	case BPF_FUNC_skb_vlan_pop:
++	case BPF_FUNC_skb_get_tunnel_key:
++	case BPF_FUNC_skb_set_tunnel_key:
++	case BPF_FUNC_get_route_realm:
++	case BPF_FUNC_skb_get_tunnel_opt:
++	case BPF_FUNC_skb_set_tunnel_opt:
++	case BPF_FUNC_skb_change_proto:
++	case BPF_FUNC_skb_change_type:
++	case BPF_FUNC_skb_under_cgroup:
++	case BPF_FUNC_get_hash_recalc:
++	case BPF_FUNC_skb_change_head:
++	case BPF_FUNC_skb_change_tail:
++	case BPF_FUNC_skb_pull_data:
++	case BPF_FUNC_csum_update:
++	case BPF_FUNC_set_hash_invalid:
++	case BPF_FUNC_get_socket_cookie:
++	case BPF_FUNC_get_socket_uid:
++	case BPF_FUNC_set_hash:
++	case BPF_FUNC_skb_adjust_room:
++	case BPF_FUNC_sk_redirect_map:
++	case BPF_FUNC_skb_get_xfrm_state:
++	case BPF_FUNC_skb_load_bytes_relative:
++	case BPF_FUNC_sk_redirect_hash:
++	case BPF_FUNC_lwt_push_encap:
++	case BPF_FUNC_lwt_seg6_store_bytes:
++	case BPF_FUNC_lwt_seg6_adjust_srh:
++	case BPF_FUNC_lwt_seg6_action:
++	case BPF_FUNC_skb_cgroup_id:
++	case BPF_FUNC_skb_ancestor_cgroup_id:
++	case BPF_FUNC_skb_ecn_set_ce:
++	case BPF_FUNC_sk_assign:                 // needs additional synchronization?
++	case BPF_FUNC_csum_level:
++	case BPF_FUNC_skb_cgroup_classid:
++	case BPF_FUNC_skb_set_tstamp:                 // needs additional synchronization?
++		a = kzalloc(sizeof(struct bpf_helper), GFP_ATOMIC);
++		if (!a)
++			return;
++		a->addr = fn;
++		hash_add(bpf_sandbox_env[prog_id].skb_func_ht, &a->hnode, fn);
++		break;
++	}
++}
++
++/**
++ * xdp_func_ht_add - adds a function that takes xdp_buff as its argument
++ *					 to the hashtable
++ *
++ * @i: function id
++ * @prog_id: program type identifier
++ * @fn: helper function
++ *
++ * Adds the new function, fn, to the hashtable of xdp helper functions
++ * for the bpf sandbox environment for the specified program type.
++ */
++static void xdp_func_ht_add(int i, u64 prog_id, u64 fn)
++{
++	struct bpf_helper *a;
++
++	switch (i) {
++	case BPF_FUNC_xdp_adjust_head:
++	case BPF_FUNC_xdp_adjust_meta:
++	case BPF_FUNC_xdp_adjust_tail:
++	case BPF_FUNC_xdp_get_buff_len:
++	case BPF_FUNC_xdp_load_bytes:
++	case BPF_FUNC_xdp_store_bytes:
++		a = kzalloc(sizeof(struct bpf_helper), GFP_ATOMIC);
++		if (!a)
++			return;
++		a->addr = fn;
++		hash_add(bpf_sandbox_env[prog_id].xdp_func_ht, &a->hnode, fn);
++		break;
++	}
++}
++
++/**
++ * record_map_ops() - Keeps track of valid map operations (for CFI)
++ *
++ * @prog_id: program type identifier
++ * @ops: a struct containing all the operations for a particular map type
++ *
++ * Each map type has their own implementation of map functions, which is not
++ * captured by init_sandbox_env (i.e., just iterating through
++ * [prog_type]_func_proto in bpf_verifier_ops). This function is to be called
++ * in the verifier's post-verification fixup, recording the map operations of
++ * every map type in the eBPF program.
++ */
++void record_map_ops(u64 prog_id, const struct bpf_map_ops *ops)
++{
++	// If either one of the map ops is already recorded, return
++	// because we already have all the ops for this map type
++	if (is_allowed_helper(prog_id, (u64)ops->map_lookup_elem))
++		return;
++
++	func_ht_add(prog_id, (u64)ops->map_lookup_elem);
++	func_ht_add(prog_id, (u64)ops->map_update_elem);
++	func_ht_add(prog_id, (u64)ops->map_delete_elem);
++	func_ht_add(prog_id, (u64)ops->map_push_elem);
++	func_ht_add(prog_id, (u64)ops->map_pop_elem);
++	func_ht_add(prog_id, (u64)ops->map_peek_elem);
++	func_ht_add(prog_id, (u64)ops->map_redirect);
++	func_ht_add(prog_id, (u64)ops->map_for_each_callback);
++	func_ht_add(prog_id, (u64)ops->map_lookup_percpu_elem);
++}
++
++
++/**
++ * init_sandbox_env() - initializes sandbox environments
++ *
++ * @env: bpf verification environment
++ *
++ * For each bpf program type, a sandbox environment is initialized. Then the
++ * function hashtable of allowed helper functions for each program type is
++ * created. Finally, the helper functions obtained from the verifier at compile
++ * time are stored in the function hashtable for each bpf sandbox environment
++ * type.
++ */
++void init_sandbox_env(void *env)
++{
++	const struct bpf_verifier_env *verifier_env = env;
++	const struct bpf_func_proto *fn;
++	u64 prog_id = verifier_env->prog->type;
++
++	// Initialize sandbox_env
++	if (!bpf_sandbox_env) {
++		bpf_sandbox_env = kmalloc_array(MAX_BPF_PROG_TYPE,
++						sizeof(struct bpf_sandbox_env), GFP_KERNEL);
++		for (int i = 0; i < MAX_BPF_PROG_TYPE; i++) {
++			hash_init(bpf_sandbox_env[i].func_ht);
++			hash_init(bpf_sandbox_env[i].skb_func_ht);
++			hash_init(bpf_sandbox_env[i].xdp_func_ht);
++		}
++	}
++
++	if (hash_empty(bpf_sandbox_env[prog_id].func_ht)) {
++		// Store the helper function addresses to a hashtable
++		for (int i = 0; i <= __BPF_FUNC_MAX_ID; i++) {
++			fn = bpf_verifier_ops[prog_id]->get_func_proto(i, verifier_env->prog);
++			if (!fn)
++				continue;
++			func_ht_add(prog_id, (u64)fn->func);
++			skb_func_ht_add(i, prog_id, (u64)fn->func);
++			xdp_func_ht_add(i, prog_id, (u64)fn->func);
++
++			// TEST
++			// pr_info("prog_type = %lld, func_id_name = %s, fn64 = %llx",
++			//	prog_id, func_id_name(i), (u64)fn->func);
++			// pr_info("is_allowed_helper = %d, is_skb_helper = %d",
++			//	is_allowed_helper(prog_id, (u64)fn->func),
++			//	is_skb_helper(prog_id, (u64)fn->func));
++			// pr_info("is_xdp_helper = %d", is_xdp_helper(prog_id, (u64)fn->func));
++		}
++	}
++}
++
++union bpf_sandbox *sandboxes;
++EXPORT_SYMBOL(sandboxes);
++
++uintptr_t bpf_sandbox_and_mask;
++EXPORT_SYMBOL(bpf_sandbox_and_mask);
++
++void *sandbox_ctx;
++EXPORT_SYMBOL(sandbox_ctx);
++
++/**
++ * init_bpf_sandbox() - sets up sandbox management
++ *
++ * Initializes sandbox management by allocating memory for sandbox
++ * instances. If a problem occurs with memory allocation, kernel panic occurs
++ * and status is shown through log messages. Finally, address masks are
++ * generated and stored.
++ */
++static int __init init_bpf_sandbox(void)
++{
++	pr_info("BPF Sandbox: Core %d initializing sandbox management...", smp_processor_id());
++	sandboxes = kmalloc(BPF_SANDBOX_TOTAL_SIZE * nr_cpu_ids, GFP_ATOMIC);
++	if (!sandboxes)
++		panic("BPF Sandbox: could not allocate sandboxes");
++
++	bpf_sandbox_and_mask = gen_and_mask(BPF_SANDBOX_SIZE);
++	for (int i = 0; i < nr_cpu_ids; i++) {
++		sandboxes[i].info.or_mask = gen_or_mask(sandboxes[i].mem.private, BPF_SANDBOX_SIZE);
++#ifdef CONFIG_BPF_SANDBOX_MTE
++		bpf_mte_tag_mem(bpf_mte_set_tag(sandboxes[i].mem.private, BPF_MTE_TAG_SANDBOX),
++				BPF_SANDBOX_SIZE, true);
++#endif                 /* CONFIG_BPF_SANDBOX_MTE */
++	}
++
++	pr_info("BPF Sandbox: sandbox management initialized.");
++	return 0;
++}
++
++core_initcall(init_bpf_sandbox);
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index adc83cb82..fc9d2a0eb 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -35,6 +35,7 @@
+ #include <linux/rcupdate_trace.h>
+ #include <linux/memcontrol.h>
+ #include <linux/trace_events.h>
++#include <linux/bpf_ctx.h>
+ 
+ #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+ 			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
+@@ -2628,6 +2629,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr)
+ 	if (err < 0)
+ 		goto free_prog_sec;
+ 
++	/*** SANDBOX BPF START ***/
++	bpf_ctx_bitmap_alloc(prog, type);
++	/*** SANDBOX BPF END ***/
++
+ 	/* run eBPF verifier */
+ 	err = bpf_check(&prog, attr, uattr);
+ 	if (err < 0)
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 8ed149cc9..65beb9608 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -24,6 +24,9 @@
+ #include <linux/bpf_lsm.h>
+ #include <linux/btf_ids.h>
+ #include <linux/poison.h>
++#include <linux/bpf_sandbox.h>
++#include <linux/bpf_ctx.h>
++#include <linux/bpf_map.h>
+ 
+ #include "disasm.h"
+ 
+@@ -16684,6 +16687,23 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
+ 
+ 			map_ptr = BPF_MAP_PTR(aux->map_ptr_state);
+ 			ops = map_ptr->ops;
++			/*** SANDBOX BPF START ***/
++			#ifdef CONFIG_BPF_SFI_TRAMPOLINE
++			record_map_ops(prog->type, ops);
++			#endif
++			// Disable lookup function inlining
++			#ifdef CONFIG_BPF_SFI_MAP_MASKING
++			if (IS_SANDBOX_ENABLED(prog->type)) {
++				bpf_sandbox_add_map_lookup(ops);
++				goto patch_map_ops_generic;
++			}
++			#endif
++			#ifdef CONFIG_BPF_SANDBOX_MTE
++			if (IS_SANDBOX_ENABLED(prog->type)) {
++				goto patch_map_ops_generic;
++			}
++			#endif
++			/*** SANDBOX BPF END ***/
+ 			if (insn->imm == BPF_FUNC_map_lookup_elem &&
+ 			    ops->map_gen_lookup) {
+ 				cnt = ops->map_gen_lookup(map_ptr, insn_buf);
+@@ -17785,6 +17805,12 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
+ 	if (ret < 0)
+ 		goto skip_full_check;
+ 
++	/*** SANDBOX BPF START ***/
++	#if defined(CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT) || defined(CONFIG_BPF_SFI_TRAMPOLINE)
++	init_sandbox_env(env);
++	#endif /* CONFIG_BPF_SANDBOX_MEMORY_MANAGEMENT || CONFIG_BPF_SFI_TRAMPOLINE */
++	/*** SANDBOX BPF END ***/
++
+ 	ret = check_subprogs(env);
+ 	if (ret < 0)
+ 		goto skip_full_check;
+@@ -17839,9 +17865,24 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
+ 			sanitize_dead_code(env);
+ 	}
+ 
+-	if (ret == 0)
++	if (ret == 0) {
+ 		/* program is valid, convert *(u32*)(ctx + off) accesses */
+-		ret = convert_ctx_accesses(env);
++		/*** SANDBOX BPF START ***/
++		#ifdef CONFIG_BPF_SANDBOX_CTX
++		if (IS_SANDBOX_CTX_SUPPORTED(env->prog->type)) {
++			#ifdef CONFIG_BPF_SANDBOX_CTX_BITMAP
++			record_ctx_accesses(env);
++			#endif /* CONFIG_BPF_SANDBOX_CTX_BITMAP */
++		} else
++			ret = convert_ctx_accesses(env);
++		#elif defined(CONFIG_BPF_SANDBOX_STACK_MANAGEMENT)
++			record_ctx_accesses(env);
++			ret = convert_ctx_accesses(env);
++		#else
++			ret = convert_ctx_accesses(env);
++		#endif /* CONFIG_BPF_SANDBOX_CTX */
++		/*** SANDBOX BPF END ***/
++	}
+ 
+ 	if (ret == 0)
+ 		ret = do_misc_fixups(env);
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 39d1d9316..9dfe5082e 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -2355,7 +2355,7 @@ config TEST_USER_COPY
+ 
+ config TEST_BPF
+ 	tristate "Test BPF filter functionality"
+-	depends on m && NET
++	depends on NET
+ 	help
+ 	  This builds the "test_bpf" module that runs various test vectors
+ 	  against the BPF interpreter or BPF JIT compiler depending on the
+diff --git a/lib/Kconfig.kasan b/lib/Kconfig.kasan
+index fdca89c05..a9d65feeb 100644
+--- a/lib/Kconfig.kasan
++++ b/lib/Kconfig.kasan
+@@ -60,7 +60,7 @@ config CC_HAS_KASAN_MEMINTRINSIC_PREFIX
+ 
+ choice
+ 	prompt "KASAN mode"
+-	default KASAN_GENERIC
++	default KASAN_HW_TAGS
+ 	help
+ 	  KASAN has three modes:
+ 
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index a61eeee30..1893be930 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -454,6 +454,8 @@ static inline void kasan_force_async_fault(void) { }
+ 
+ #ifdef CONFIG_KASAN_SW_TAGS
+ u8 kasan_random_tag(void);
++#elif defined(CONFIG_BPF_SANDBOX_MTE)
++static inline u8 kasan_random_tag(void) { return 0xFF; }
+ #elif defined(CONFIG_KASAN_HW_TAGS)
+ static inline u8 kasan_random_tag(void) { return hw_get_random_tag(); }
+ #else
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 1d6f16592..2091a9c8d 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -82,6 +82,9 @@
+ #include <net/mptcp.h>
+ #include <net/netfilter/nf_conntrack_bpf.h>
+ 
++#include <linux/bpf_mte.h>
++#include <linux/bpf_sandbox.h>
++
+ static const struct bpf_func_proto *
+ bpf_sk_base_func_proto(enum bpf_func_id func_id);
+ 
+@@ -1729,7 +1732,8 @@ BPF_CALL_4(bpf_skb_load_bytes, const struct sk_buff *, skb, u32, offset,
+ 	if (unlikely(offset > INT_MAX))
+ 		goto err_clear;
+ 
+-	ptr = skb_header_pointer(skb, offset, len, to);
++	ptr = skb_header_pointer(bpf_mte_set_tag(skb, BPF_MTE_TAG_KERNEL),
++				 offset, len, to);
+ 	if (unlikely(!ptr))
+ 		goto err_clear;
+ 	if (ptr != to)
+@@ -8755,7 +8759,7 @@ static bool __is_valid_xdp_access(int off, int size)
+ 		return false;
+ 	if (off % size != 0)
+ 		return false;
+-	if (size != sizeof(__u32))
++	if (size != sizeof(__u32) && size != sizeof(__u64))
+ 		return false;
+ 
+ 	return true;
+-- 
+2.25.1
+
