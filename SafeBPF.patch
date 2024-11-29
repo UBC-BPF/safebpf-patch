@@ -1,6 +1,6 @@
-From 710b33fe3cecb2624e4b1e4a2653692e3dc57638 Mon Sep 17 00:00:00 2001
+From 6470a110d10c56ba07391536074e3090b42c7923 Mon Sep 17 00:00:00 2001
 From: Soo Yee Lim <sooyee@cs.ubc.ca>
-Date: Tue, 10 Sep 2024 00:02:28 -0700
+Date: Fri, 29 Nov 2024 02:57:05 -0800
 Subject: [PATCH] SandBPF
 
 \n\nAdd support for dynamic sandboxing of eBPF programs.
@@ -13,7 +13,7 @@ Signed-off-by: Soo Yee Lim <sooyee@cs.ubc.ca>
  arch/arm64/lib/mte.S                 |  16 +
  arch/arm64/net/bpf_jit_comp.c        | 380 +++++++++++++++++++++-
  arch/x86/include/asm/bpf_sandbox.h   | 165 ++++++++++
- arch/x86/net/bpf_jit_comp.c          | 277 +++++++++++++++-
+ arch/x86/net/bpf_jit_comp.c          | 278 +++++++++++++++-
  include/linux/bpf.h                  |  24 ++
  include/linux/bpf_ctx.h              | 187 +++++++++++
  include/linux/bpf_malloc.h           |  13 +
@@ -21,7 +21,7 @@ Signed-off-by: Soo Yee Lim <sooyee@cs.ubc.ca>
  include/linux/bpf_mte.h              | 137 ++++++++
  include/linux/bpf_sandbox.h          | 342 ++++++++++++++++++++
  include/linux/filter.h               |  66 +++-
- include/uapi/linux/bpf.h             |   9 +-
+ include/uapi/linux/bpf.h             |   7 +-
  kernel/bpf/Kconfig                   | 205 ++++++++++++
  kernel/bpf/Makefile                  |   2 +
  kernel/bpf/arraymap.c                |  86 ++++-
@@ -40,7 +40,7 @@ Signed-off-by: Soo Yee Lim <sooyee@cs.ubc.ca>
  lib/Kconfig.kasan                    |   2 +-
  mm/kasan/kasan.h                     |   2 +
  net/core/filter.c                    |   8 +-
- 33 files changed, 4106 insertions(+), 75 deletions(-)
+ 33 files changed, 4106 insertions(+), 74 deletions(-)
  create mode 100644 arch/arm64/include/asm/bpf_sandbox.h
  create mode 100644 arch/x86/include/asm/bpf_sandbox.h
  create mode 100644 include/linux/bpf_ctx.h
@@ -945,7 +945,7 @@ index 000000000..c4053114e
 +
 +#endif /* _ASM_BPF_SANDBOX_H */
 diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
-index 1056bbf55..b34fd905a 100644
+index 1056bbf55..2e8bd3513 100644
 --- a/arch/x86/net/bpf_jit_comp.c
 +++ b/arch/x86/net/bpf_jit_comp.c
 @@ -16,19 +16,28 @@
@@ -1169,7 +1169,15 @@ index 1056bbf55..b34fd905a 100644
  	push_callee_regs(&prog, callee_regs_used);
  
  	ilen = prog - temp;
-@@ -1031,6 +1151,12 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
+@@ -1005,6 +1125,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
+ 		s64 jmp_offset;
+ 		s16 insn_off;
+ 		u8 jmp_cond;
++		u64 imm64;
+ 		u8 *func;
+ 		int nops;
+ 
+@@ -1031,6 +1152,12 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
  			emit_mov_reg(&prog,
  				     BPF_CLASS(insn->code) == BPF_ALU64,
  				     dst_reg, src_reg);
@@ -1182,12 +1190,12 @@ index 1056bbf55..b34fd905a 100644
  			break;
  
  			/* neg dst */
-@@ -1097,6 +1223,15 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
+@@ -1097,6 +1224,15 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
  
  		case BPF_LD | BPF_IMM | BPF_DW:
  			emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);
 +			#ifdef CONFIG_BPF_SFI_MAP_MASKING
-+			u64 imm64 = (u64)insn[1].imm << 32 | insn[0].imm;
++			imm64 = (u64)insn[1].imm << 32 | insn[0].imm;
 +
 +			if (virt_addr_valid(imm64) && is_active_map(imm64)) {
 +				struct bpf_map *map = (struct bpf_map *)imm64;
@@ -1198,7 +1206,7 @@ index 1056bbf55..b34fd905a 100644
  			insn++;
  			i++;
  			break;
-@@ -1358,7 +1493,34 @@ st:			if (is_imm8(insn->off))
+@@ -1358,7 +1494,34 @@ st:			if (is_imm8(insn->off))
  		case BPF_STX | BPF_MEM | BPF_H:
  		case BPF_STX | BPF_MEM | BPF_W:
  		case BPF_STX | BPF_MEM | BPF_DW:
@@ -1234,7 +1242,7 @@ index 1056bbf55..b34fd905a 100644
  			break;
  
  			/* LDX: dst_reg = *(u8*)(src_reg + off) */
-@@ -1415,7 +1577,42 @@ st:			if (is_imm8(insn->off))
+@@ -1415,7 +1578,42 @@ st:			if (is_imm8(insn->off))
  				start_of_ldx = prog;
  				end_of_jmp[-1] = start_of_ldx - end_of_jmp;
  			}
@@ -1278,7 +1286,7 @@ index 1056bbf55..b34fd905a 100644
  			if (BPF_MODE(insn->code) == BPF_PROBE_MEM) {
  				struct exception_table_entry *ex;
  				u8 *_insn = image + proglen + (start_of_ldx - temp);
-@@ -1535,8 +1732,36 @@ st:			if (is_imm8(insn->off))
+@@ -1535,8 +1733,36 @@ st:			if (is_imm8(insn->off))
  			/* call */
  		case BPF_JMP | BPF_CALL: {
  			int offs;
@@ -1316,7 +1324,7 @@ index 1056bbf55..b34fd905a 100644
  			if (tail_call_reachable) {
  				/* mov rax, qword ptr [rbp - rounded_stack_depth - 8] */
  				EMIT3_off32(0x48, 0x8B, 0x85,
-@@ -1549,8 +1774,10 @@ st:			if (is_imm8(insn->off))
+@@ -1549,8 +1775,10 @@ st:			if (is_imm8(insn->off))
  					return -EINVAL;
  				offs = x86_call_depth_emit_accounting(&prog, func);
  			}
@@ -1328,7 +1336,7 @@ index 1056bbf55..b34fd905a 100644
  			break;
  		}
  
-@@ -1808,6 +2035,14 @@ st:			if (is_imm8(insn->off))
+@@ -1808,6 +2036,14 @@ st:			if (is_imm8(insn->off))
  			/* Update cleanup_addr */
  			ctx->cleanup_addr = proglen;
  			pop_callee_regs(&prog, callee_regs_used);
@@ -1343,7 +1351,7 @@ index 1056bbf55..b34fd905a 100644
  			EMIT1(0xC9);         /* leave */
  			emit_return(&prog, image + addrs[i - 1] + (prog - temp));
  			break;
-@@ -2456,6 +2691,18 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+@@ -2456,6 +2692,18 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
  	int pass;
  	int i;
  
@@ -1362,7 +1370,7 @@ index 1056bbf55..b34fd905a 100644
  	if (!prog->jit_requested)
  		return orig_prog;
  
-@@ -2518,7 +2765,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+@@ -2518,7 +2766,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
  	for (pass = 0; pass < MAX_PASSES || image; pass++) {
  		if (!padding && pass >= PADDING_PASSES)
  			padding = true;
@@ -2296,7 +2304,7 @@ index 370c96acd..1ed5d4542 100644
  	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
  		struct bpf_prog_stats *stats;
 diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
-index 62ce1f5d1..9e756a96b 100644
+index 62ce1f5d1..5a1067827 100644
 --- a/include/uapi/linux/bpf.h
 +++ b/include/uapi/linux/bpf.h
 @@ -986,6 +986,7 @@ enum bpf_prog_type {
@@ -2307,17 +2315,6 @@ index 62ce1f5d1..9e756a96b 100644
  };
  
  enum bpf_attach_type {
-@@ -5968,9 +5969,9 @@ struct __sk_buff {
- 	__u32 gso_segs;
- 	__bpf_md_ptr(struct bpf_sock *, sk);
- 	__u32 gso_size;
--	__u8  tstamp_type;
- 	__u32 :24;		/* Padding, future use. */
- 	__u64 hwtstamp;
-+	__u8  tstamp_type;
- };
- 
- struct bpf_tunnel_key {
 @@ -6139,9 +6140,9 @@ enum xdp_action {
   * new fields must be added to the end of this structure
   */
